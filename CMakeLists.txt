@@ -24,22 +24,26 @@ add_subdirectory(third_party/SDL EXCLUDE_FROM_ALL)
 add_compile_definitions(ASSETS_PATH="${ASSETS_PATH}" PROJECT_NAME="${CMAKE_PROJECT_NAME}")
 add_executable(${CMAKE_PROJECT_NAME} WIN32)
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    Utils.cpp
-    Graphics.cpp
-    Keyboard.cpp
-    Timer.cpp
-    Texture.cpp
-    Palette.cpp
-    Font.cpp
-    VarWidthFont.cpp
-    TextLabel.cpp
-    TextInput.cpp
-    UIBox.cpp
-    TextBox.cpp
-    InputBox.cpp
-    Hud.cpp
-    main.cpp
+    src/core/Utils.cpp
+    src/graphics/Graphics.cpp
+    src/core/Keyboard.cpp
+    src/core/Timer.cpp
+    src/graphics/Texture.cpp
+    src/graphics/Palette.cpp
+    src/text/Font.cpp
+    src/text/VarWidthFont.cpp
+    src/text/TextLabel.cpp
+    src/text/TextInput.cpp
+    src/ui/UIBox.cpp
+    src/ui/TextBox.cpp
+    src/ui/InputBox.cpp
+    src/ui/Hud.cpp
+    src/room/RoomView.cpp
+    src/sprite/SpriteSet.cpp
+    src/sprite/EntityTable.cpp
+    src/main.cpp
 )
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 TARGET_COMPILE_OPTIONS(${CMAKE_PROJECT_NAME} PRIVATE ${C_FLAGS})
 
 # Copy assets from source to build
