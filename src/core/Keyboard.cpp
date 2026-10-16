@@ -21,14 +21,17 @@ void Keyboard::OnKeyEvent(const SDL_KeyboardEvent& event)
     if (event.type == SDL_EVENT_KEY_DOWN)
     {
         key_states[event.scancode] = true;
-        for (const auto& handler : handlers) {
+        // A copy: a handler may register or unregister handlers (the title screen does).
+        const auto current = handlers;
+        for (const auto& handler : current) {
             handler->OnKeyDown(event.scancode, event.mod);
         }
     }
     else if (event.type == SDL_EVENT_KEY_UP)
     {
         key_states[event.scancode] = false;
-        for (const auto& handler : handlers) {
+        const auto current = handlers;
+        for (const auto& handler : current) {
             handler->OnKeyUp(event.scancode, event.mod);
         }
     }

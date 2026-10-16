@@ -13,6 +13,9 @@ Graphics::Graphics(unsigned int width, unsigned int height, const std::string& t
         throw std::runtime_error(SDL_GetError());
     }
 
+    // The picture is made for width x height: scaled to the window (bars if the shape differs).
+    SDL_SetRenderLogicalPresentation(renderer, static_cast<int>(width), static_cast<int>(height), SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
     const SDL_Rect textarea = {0, 0, 800, 600};
     SDL_SetTextInputArea(window, &textarea, 0);
     SDL_StartTextInput(window);
@@ -44,9 +47,13 @@ void Graphics::Render(const std::vector<std::shared_ptr<IDrawable>> drawables)
 
     // Debug aid: LS_SCREENSHOT=<file.bmp> saves the first frame and quits.
     static bool shot_done = false;
+    static int shot_frames = 0;
     if (!shot_done)
     {
-        if (const char* path = std::getenv("LS_SCREENSHOT"))
+        // LS_SCREENSHOT_FRAME=n waits for the n-th frame (default: the first one).
+        static const char* frame_env = std::getenv("LS_SCREENSHOT_FRAME");
+        const int wanted = frame_env ? std::atoi(frame_env) : 1;
+        if (const char* path = (++shot_frames >= wanted) ? std::getenv("LS_SCREENSHOT") : nullptr)
         {
             shot_done = true;
             if (SDL_Surface* surf = SDL_RenderReadPixels(renderer, nullptr))

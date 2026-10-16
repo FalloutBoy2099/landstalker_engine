@@ -125,7 +125,7 @@ const SpriteSet::Frame* SpriteSet::GetFrame(const std::string& frame) const
 }
 
 void SpriteSet::Draw(SDL_Renderer* renderer, const std::string& frame, float x, float y,
-                     float scale, bool hflip) const
+                     float scale, bool hflip, SDL_Color tint) const
 {
     const Frame* fr = GetFrame(frame);
     if (!fr) return;
@@ -133,6 +133,9 @@ void SpriteSet::Draw(SDL_Renderer* renderer, const std::string& frame, float x, 
     const float ax = hflip ? (fr->width - fr->anchor_x) : fr->anchor_x;
     const SDL_FRect dst = { x - ax * scale, y - fr->anchor_y * scale,
                             fr->width * scale, fr->height * scale };
+    const bool tinted = tint.r != 255 || tint.g != 255 || tint.b != 255;
+    if (tinted) SDL_SetTextureColorMod(fr->texture, tint.r, tint.g, tint.b);
     SDL_RenderTextureRotated(renderer, fr->texture, nullptr, &dst, 0.0, nullptr,
                              hflip ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+    if (tinted) SDL_SetTextureColorMod(fr->texture, 255, 255, 255);
 }

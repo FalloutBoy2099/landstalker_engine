@@ -51,6 +51,9 @@ public:
     // Walk cycle frames for a kind (BACK or FRONT); empty if the entity has none.
     // Each frame carries its own anchor.
     const std::vector<Image>& GetWalkFrames(int entity, Kind kind);
+    // The same for the attack swing and the hurt pose of the enemies.
+    enum Pose { WALK = 0, ATTACK = 1, HURT = 2 };
+    const std::vector<Image>& GetPoseFrames(int entity, Pose pose, Kind kind);
     Kind GetKind(int entity, int orientation, bool& hflip) const;
 
 private:
@@ -64,6 +67,7 @@ private:
         struct Slot { std::string file; int w = 0, h = 0, ax = 0, ay = 0; Image image; bool loaded = false; };
         Slot def, back, front;
         std::vector<Slot> walk_back, walk_front;   // one slot per frame
+        std::vector<Slot> attack_back, attack_front, hurt_back, hurt_front;
     };
 
     const Image* Load(Def::Slot& slot);

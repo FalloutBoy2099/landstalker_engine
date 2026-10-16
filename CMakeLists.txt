@@ -41,9 +41,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/room/RoomView.cpp
     src/sprite/SpriteSet.cpp
     src/sprite/EntityTable.cpp
+    src/audio/SoundEngine.cpp
+    third_party/nuked-opn2/ym3438.c
+    third_party/z80/z80.c
     src/main.cpp
 )
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src third_party/nuked-opn2 third_party/z80)
 TARGET_COMPILE_OPTIONS(${CMAKE_PROJECT_NAME} PRIVATE ${C_FLAGS})
 
 # Copy assets from source to build

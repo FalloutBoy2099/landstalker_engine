@@ -1,3 +1,4 @@
+#include <tuple>
 #include "sprite/EntityTable.h"
 #include <fstream>
 #include <sstream>
@@ -82,6 +83,10 @@ EntityTable::EntityTable(std::shared_ptr<Graphics> graphics, const std::filesyst
         };
         parse_walk("walk_back", d.walk_back);
         parse_walk("walk_front", d.walk_front);
+        parse_walk("attack_back", d.attack_back);
+        parse_walk("attack_front", d.attack_front);
+        parse_walk("hurt_back", d.hurt_back);
+        parse_walk("hurt_front", d.hurt_front);
         fill(d.def, "default");
         fill(d.back, "back");
         fill(d.front, "front");
@@ -95,7 +100,7 @@ EntityTable::~EntityTable()
     {
         for (auto* s : { &d.def, &d.back, &d.front })
             if (s->image.texture) SDL_DestroyTexture(s->image.texture);
-        for (auto* list : { &d.walk_back, &d.walk_front })
+        for (auto* list : { &d.walk_back, &d.walk_front, &d.attack_back, &d.attack_front, &d.hurt_back, &d.hurt_front })
             for (auto& s : *list)
                 if (s.image.texture) SDL_DestroyTexture(s.image.texture);
     }
@@ -103,13 +108,21 @@ EntityTable::~EntityTable()
 
 const std::vector<EntityTable::Image>& EntityTable::GetWalkFrames(int entity, Kind kind)
 {
+    return GetPoseFrames(entity, WALK, kind);
+}
+
+const std::vector<EntityTable::Image>& EntityTable::GetPoseFrames(int entity, Pose pose, Kind kind)
+{
     static const std::vector<Image> none;
-    static std::map<std::pair<int, int>, std::vector<Image>> cache;
+    static std::map<std::tuple<int, int, int>, std::vector<Image>> cache;
     auto it = defs.find(entity);
     if (it == defs.end() || kind == DEFAULT) return none;
-    auto& slots = (kind == BACK) ? it->second.walk_back : it->second.walk_front;
+    Def& d = it->second;
+    auto& slots = pose == WALK ? (kind == BACK ? d.walk_back : d.walk_front)
+                : pose == ATTACK ? (kind == BACK ? d.attack_back : d.attack_front)
+                                 : (kind == BACK ? d.hurt_back : d.hurt_front);
     if (slots.empty()) return none;
-    auto& out = cache[{ entity, static_cast<int>(kind) }];
+    auto& out = cache[{ entity, static_cast<int>(pose), static_cast<int>(kind) }];
     if (out.size() != slots.size())
     {
         out.clear();

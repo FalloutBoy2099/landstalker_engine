@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +16,11 @@
 #include "game/GameState.h"
 #include "game/Dialogue.h"
 #include "game/Shops.h"
+#include "game/Behaviours.h"
+#include "game/Cutscenes.h"
+#include "game/Drops.h"
+#include <deque>
+#include "audio/SoundEngine.h"
 
 // A warp as seen from the room currently loaded: the cells it covers and where it leads.
 struct RoomWarp
@@ -43,10 +49,44 @@ struct RoomEntity
     int dialogue = 0;      // index into the room's character list
     int speed;             // 0 = stationary, 1..4 = how fast it moves
     bool gravity;          // follows the floor height
+    int behaviour = 0;     // script number (game/Behaviours.h)
+    // A drop left by a dead enemy (a money bag or an item box): what it gives when touched.
+    // Animations: dying (flickers, then goes), appearing (fades in)
+    bool dying = false;
+    double die_t = 0.0, die_dur = 0.0, die_spark = 0.0;
+    int pending_gold = 0;     // dropped when the death animation ends
+    double appear_t = -1.0;   // >= 0 while the entity materialises
+    double act_t = -1.0;      // >= 0 while a boss plays its attack animation (s since it began)
+    bool falls = false;       // gravity was switched on by its script: it drops until it rests on something
+    double fall_v = 0.0;      // fall speed, height units / s
+    bool dormant = false;  // a scripted enemy that has not been "made hostile" yet
+    bool bh_init = false;
+    int pickup_gold = 0;
+    int pickup_item = -1;
+    double pickup_age = 0.0;
+    // State of the behaviour script interpreter.
+    int bh_pc = 0;         // next command, -1 = finished / idle
+    int bh_count = 0;      // ticks left of the running Pause / Move command
+    bool bh_busy = false;  // a Pause / Move command is running
+    int bh_repeat_count = 0;   // RepeatBegin / RepeatEnd
+    int bh_repeat_pc = 0;
+    int bh_speed = 1;      // units (1/16 cell) per tick
+    double bh_acc = 0.0;   // fractional ticks owed
     int move_axis = 0;     // axis an enemy is walking along: 0 = x, 1 = y (never both)
     double walk_time = 0;  // seconds spent walking: drives the walk cycle
     bool walking = false;  // moved during the last update
     double hit_flash = 0;  // s left of the "just hit" blink / stun
+    // Enemy AI state (see RoomView::UpdateEnemies)
+    enum AiState { AI_IDLE = 0, AI_CHASE, AI_LUNGE, AI_RECOVER };
+    int ai_state = AI_IDLE;
+    double ai_time = 0.0;      // time in the state (CHASE: since the player was last seen)
+    double ai_time2 = 0.0;     // hopping clock
+    double ai_cooldown = 0.0;  // s until the next lunge is allowed
+    double ai_alert = 0.0;     // s left of "was hit: knows where the player is"
+    double ai_vx = 0.0, ai_vy = 0.0;   // lunge velocity, cells / s
+    double ai_phase = 0.0;     // bobbing phase of floaters
+    bool ai_walking = true;    // patrol: walking or pausing
+    int ai_shots = 0;          // bosses: shots fired so far (picks the pattern)
     // Room-specific images (default / back / front), present for entities drawn with the
     // room palette. Empty file = use the shared entity image.
     struct Image { std::string file; int w = 0, h = 0, ax = 0, ay = 0; SDL_Texture* texture = nullptr; };
@@ -71,8 +111,11 @@ struct RoomEntity
 // Enemies with a speed chase the player once he is within AGGRO_RADIUS cells.
 // The camera follows the player and is clamped to the room; rooms smaller than the
 // viewport are centred. Drawing is clipped to the viewport.
+class Bot;
+
 class RoomView : public IDrawable, public IKeyInput
 {
+    friend class Bot;   // the play-test bot (debug/Bot.h) reads and steers the game
 public:
     RoomView(std::shared_ptr<Graphics> graphics, const std::filesystem::path& rooms_dir,
              int room_number, SDL_Rect viewport, float scale = 1.0f);
@@ -84,6 +127,8 @@ public:
     void Draw(SDL_Renderer* renderer) override;
     void OnUpdate(double delta) override;
     void SetScale(float new_scale);
+    // Plays the room music again (after the music was switched back on).
+    void RestartMusic() { playing_bgm = -1; PlayRoomMusic(); }
     float GetScale() const { return scale; }
     void OnTick(unsigned int total_ticks) override {}
     void OnKeyDown(SDL_Scancode scancode, SDL_Keymod mod) override;
@@ -95,6 +140,42 @@ public:
     // Shown for a few seconds after pickups and interactions ("" clears it).
     void SetMessageCallback(std::function<void(const std::string&)> cb) { message_cb = std::move(cb); }
     void SetGameState(std::shared_ptr<GameState> state) { game = std::move(state); }
+    // Music and sound effects (optional: the game is silent without it).
+    // Where F5 saves / F9 loads (empty: no saving).
+    void SetSavePath(std::filesystem::path path) { save_path = std::move(path); }
+    bool SaveGame();
+    bool LoadGame();
+    // Save slots: files <dir>/save1.txt ... save3.txt. F5 / F9 and the churches use the active slot.
+    static constexpr int SAVE_SLOTS = 3;
+    void SetSaveDir(std::filesystem::path dir) { save_dir = std::move(dir); }
+    std::filesystem::path SlotPath(int slot) const { return save_dir / ("save" + std::to_string(slot) + ".txt"); }
+    void SetActiveSlot(int slot) { active_slot = slot; save_path = SlotPath(slot); }
+    int ActiveSlot() const { return active_slot; }
+    // "Room 21, 123 gold" or "" if the slot is empty.
+    std::string SlotSummary(int slot) const;
+    // The menus of main.cpp: the pause menu (Esc) and the game over screen.
+    void SetPauseCallback(std::function<void()> cb) { pause_cb = std::move(cb); }
+    void SetGameOverCallback(std::function<void()> cb) { game_over_cb = std::move(cb); }
+    // The end of the game: the credits roll (see ui/CreditsScreen.h).
+    void SetCreditsCallback(std::function<void()> cb) { credits_cb = std::move(cb); }
+    // After dying: wake up at the last church, or restart the room.
+    void Respawn();
+    bool HasSavedGame() const { return !save_path.empty() && std::filesystem::exists(save_path); }
+    // While paused (behind the title screen) nothing in the room moves.
+    void SetPaused(bool p) { paused = p; }
+    void SetBehaviours(std::shared_ptr<Behaviours> b) { behaviours = std::move(b); }
+    void SetDrops(std::shared_ptr<Drops> d) { drops = std::move(d); }
+    void SetCutscenes(std::shared_ptr<Cutscenes> c) { cutscenes = std::move(c); }
+    // Runs a custom script action (cutscene) by number: texts, flags, sounds.
+    void TriggerAction(int id);
+    void DebugPose(double act_time) { for (auto& e : entities) if (entity_table && entity_table->GetEnemy(e.type)) e.act_t = act_time; }   // tests
+    void DebugKill(std::size_t index) { if (index < entities.size()) KillEnemy(index); }   // tests
+    void InflictStatus(int status);   // an ailment (see GameState::STATUS_*)
+    // Debug: lists the walkable cells where a priority tile hides the player.
+    void ScanOcclusion();
+    // Starts a new game: the intro sequence (rooms 139...) with the controls locked.
+    void BeginNewGame();
+    void SetSound(std::shared_ptr<SoundEngine> engine) { sound = std::move(engine); PlayRoomMusic(); }
     // Dialogues: the callback shows (visible = true) or hides the dialogue box with `text`.
     void SetDialogue(std::shared_ptr<Dialogue> d) { dialogue_data = std::move(d); }
     void SetDialogueCallback(std::function<void(const std::string& text, bool visible)> cb)
@@ -163,6 +244,10 @@ private:
     bool CanStandAt(double x, double y, double z) const;
     // Highest floor under the player's box at (x, y) that can be reached from height z.
     double FloorUnder(double x, double y, double z) const;
+    double PlatformTop(double x, double y, double z, int* index = nullptr) const;
+    static constexpr double LADDER_SPEED = 3.0;   // height units / s on a ladder
+    static constexpr double FAINT_TIME = 5.0;   // s lying on the ground
+    static constexpr double PLATFORM_TOLERANCE = 0.05;   // an object counts as a floor when its top is this close to the feet
     void UpdateVertical(double dt);
     void CheckPickups();
     void Interact();
@@ -183,6 +268,46 @@ private:
     void AskChoice(const std::string& text, std::function<void(bool)> handler);
     bool TryShop();
     bool OfferInn();
+    bool OfferChurch();
+    void UpdateBehaviours(double dt);
+    // Status ailments: poison (HP drain while walking), paralysis (cannot move), confusion
+    // (controls reversed), curse (cannot use the sword).
+    void CureStatus(int status);
+    void TryStatusAttack(int enemy_type);
+    void UpdateAilments(double dt);
+    // Boss animations: death throes, materialising, camera on the boss, screen shake.
+    static bool IsBossType(int type);
+    void KillEnemy(std::size_t index);
+    void StartShake(double seconds, double amplitude) { shake_t = shake_total = std::max(shake_t, seconds); shake_amp = amplitude; }
+    void UpdateEntityAnimations(double dt);
+    void UpdateFallingEntities(double dt);
+    bool TriggerHolds(int trigger, std::size_t index);
+    bool KillableEnemyExists() const;   // WaitForCondition of the behaviour scripts
+    int support_entity = -1;   // entity the player stands on, or -1
+    double arrival_x = 0.0, arrival_y = 0.0;   // where the player entered the room (the raft warps wait until it is far from here)
+    // The player faints (CSA_0000, the fall down the waterfall): he lies still for a while, then in
+    // the Waterfall Shrine Entrance (room 426) he is carried to the Massan mayor's house.
+    bool fainted = false;
+    double faint_t = 0.0;
+    bool player_hidden = false;   // not drawn (asleep in a bed)
+    bool faint_warp = false;   // the pending warp is the one to the mayor's house
+    void StartFaint();
+    void UpdateFaint(double dt);
+    double input_hold = 0.0;   // s the player cannot move (a raft ride starts: the original plays an idle recording)
+    // Attack and hurt poses of the enemies: the frame to draw instead of the walking image
+    // (see EntityTable::GetPoseFrames), or false.
+    bool EnemyPoseFrame(const RoomEntity& e, EntityTable::Image& frame, bool& flip);
+    static double AttackAnimTime(int type) { return IsBossType(type) ? 0.9 : 0.5; }
+    void FinishDying(std::size_t index);
+    double shake_t = 0.0, shake_total = 0.0, shake_amp = 0.0;
+    int camera_focus = -1;    // entity the camera looks at during a cutscene (-1: the player)
+    bool CureAilmentsWith(int item);
+    double poison_walk = 0.0;
+    int poison_ticks = 0;
+    double paralysis_time = 0.0;
+    int paralysis_presses = 0;
+    void BehaviourTick(std::size_t index, bool& moved);
+    bool BehaviourStep(std::size_t index, bool noclip = false);
     void OpenMenu();
     void CloseMenu();
     void RefreshMenu();
@@ -194,6 +319,29 @@ private:
     void ApplySwingHit();
     void UpdateCombat(double dt);
     void UpdateEnemies(double dt);
+    double EnemySpeed(const RoomEntity& e) const;
+    // Projectiles thrown by bosses (fireballs, axes), flying along the grid axes.
+    struct Projectile
+    {
+        int type = 0;                 // entity type whose image it uses
+        double x = 0, y = 0, z = 0;
+        double vx = 0, vy = 0;        // cells / s
+        int attack = 1;
+        bool returns = false;         // a boomerang: comes back to its owner
+        int owner = -1;
+        double age = 0.0;
+        int orientation = 0;
+    };
+    std::vector<Projectile> projectiles;
+    void SpawnProjectile(std::size_t owner, int type, double vx, double vy, int attack, bool returns, double lateral);
+    void UpdateProjectiles(double dt);
+    void HurtPlayer(int attack, double from_x, double from_y, bool knockback = true);
+    void UpdateFloorEffects(double dt);
+    bool IceSlide(int& dir_x, int& dir_y) const;
+    double heal_acc = 0.0;   // Healing Boots
+    void BossFire(std::size_t index, int type, double speed, int attack, int count, bool returns);
+    bool UpdateBoss(std::size_t index, double dt);
+    bool EnemyMove(std::size_t index, double dx, double dy, bool ghost);
     bool CanEnemyStandAt(std::size_t index, double x, double y, double z) const;
     void Die();
     bool IsAliveEnemy(std::size_t index) const;
@@ -202,7 +350,8 @@ private:
     int FloorHeight(int cell_x, int cell_y) const;
     void CheckWarps();
     void UpdateStatus();
-    void DrawLayer(SDL_Renderer* renderer, const std::vector<int>& layer, int layer_offset_tiles) const;
+    void DrawLayer(SDL_Renderer* renderer, const std::vector<int>& layer, int layer_offset_tiles,
+                   SDL_Texture* texture = nullptr) const;
     SDL_FPoint ToScreen(float world_x, float world_y, float height_px = 0.0f) const;
     void DrawCell(SDL_Renderer* renderer, int wx, int wy, float height_px) const;
     void FillCell(SDL_Renderer* renderer, double wx, double wy, double half, float height_px, SDL_FColor colour) const;
@@ -228,6 +377,7 @@ private:
     static constexpr double PLAYER_HEIGHT = 2.0;    // collision box height, height units (32 px)
     static constexpr int PLAYER_ATTACK = 8;           // sword damage before defence (assumed)
     static constexpr double AGGRO_RADIUS = 6.0;       // cells: enemies chase inside this
+    static constexpr double BEHAVIOUR_TICK_HZ = 30.0;   // script ticks per second (calibrated by feel)
     static constexpr double ENEMY_BASE_SPEED = 0.6;   // cells/s at speed 1, +0.6 per level
     static constexpr double ATTACK_COOLDOWN = 0.4;
     static constexpr double HURT_POSE_TIME = 0.3;
@@ -333,6 +483,84 @@ private:
     std::vector<int> chest_contents;     // values from room.yaml, one per chest entity in order
     bool chests_enabled = false;
     std::shared_ptr<GameState> game;
+    std::shared_ptr<SoundEngine> sound;
+    std::shared_ptr<Behaviours> behaviours;
+    std::shared_ptr<Drops> drops;
+    void SpawnDrop(double x, double y, double z, int enemy_type, int gold);
+    std::shared_ptr<Cutscenes> cutscenes;
+    int cutscene_source = -1;                 // entity whose script started the running cutscene
+    std::deque<Cutscenes::Op> cutscene_ops;   // what is left of the running cutscene
+    bool cutscene_answer_valid = false;       // the last yes/no answer, until a branch uses it
+    bool cutscene_answer = false;
+    double page_wait = 0.0;                   // s a cutscene box stays up (0 = until dismissed)
+    double page_timer = 0.0;
+    bool paused = false;
+    // Screen effects of the cutscenes: a coloured veil over the room (fades, flashes).
+    enum class FxMode { NONE, TO_LEVEL, PULSE };
+    FxMode fx_mode = FxMode::NONE;
+    double fx_level = 0.0;      // 0 = nothing, 1 = the veil covers everything
+    double fx_from = 0.0, fx_to = 0.0, fx_t = 0.0, fx_dur = 0.0;
+    SDL_Color fx_color{ 0, 0, 0, 255 };
+    double cutscene_busy = 0.0;   // s the running cutscene waits (an effect, a pause)
+    bool busy_then_warp = false;  // ... and then does the warp that was prepared
+    double StartFx(const std::string& name);   // returns how long it takes
+    void UpdateFx(double dt);
+    // Friday: her overlay sprite in the cutscenes (flies in, hovers, flies off).
+    int friday_state = 0;         // 0 hidden, 1 appearing, 2 hovering, 3 leaving
+    double friday_t = 0.0;
+    void DrawFriday(SDL_Renderer* renderer);
+    std::filesystem::path save_dir;
+    int active_slot = 1;
+    std::function<void()> pause_cb, game_over_cb, credits_cb;
+    bool game_over_shown = false;
+    bool input_locked = false;                // scripted scene: the keyboard does nothing
+    bool intro_active = false;                // the new-game intro is running (Enter skips it)
+    struct PendingWarp { int room, x, y, dir; bool fall = false; int climb_kind = 0; };   // climb_kind: 1 ladder, 2 elevator
+    // Rooms replaced by another version once a story flag is set (assets/text/room_transitions.txt).
+    struct Transition { int from, to, flag; };
+    std::vector<Transition> transitions;
+    int Redirect(int room) const;         // the version of `room` to enter now (CheckForRoomTransition)
+    int OriginalRoom(int room) const;     // the room whose warps `room` uses (GetOriginalRoomNum)
+    int climb_dest = -1;       // room above, reached by a ladder or an elevator (room.yaml climb_destination)
+    int room_max_height = 0;   // room.yaml z_end: going higher takes the ladder / elevator out of the room
+    bool climbing = false;     // hanging on a ladder this frame
+    void ClimbOut(int kind);
+    // Animated blocks of the room (water, lava...): see UpdateAnimations.
+    struct RoomAnim
+    {
+        std::string file;
+        int frames = 0, delay = 1, shown = -1;
+        std::vector<int> blocks;
+        SDL_Surface* atlas = nullptr;
+    };
+    std::vector<RoomAnim> animations;
+    double anim_clock = 0.0;
+    static SDL_Texture* MakeTexture(SDL_Renderer* renderer, SDL_Surface* surface);
+    void FreeAnimations();
+    void UpdateAnimations(double dt);
+    int fall_dest = -1;        // room entered by falling into a pit cell (room.yaml fall_destination)
+    void CheckPit();           // standing on a pit: fall to the room below
+    bool warp_pending = false;
+    PendingWarp pending_warp{};
+    void ApplyPendingWarp();
+    void SkipIntro();
+    // Scripted controller input (the "playback" of the original)
+    const Behaviours::Playback* playback = nullptr;
+    std::size_t playback_index = 0;
+    double playback_timer = 0.0;
+    void StartPlayback(int sequence);
+    void ContinueCutscene();
+    void DoTileSwapTrigger(int trigger);
+    std::filesystem::path save_path;
+    // Last church where the adventure was recorded: where the player wakes up after dying.
+    int church_room = -1;
+    double church_x = 0.0, church_y = 0.0;
+    void Sfx(int id) { if (sound) sound->Command(id); }
+    void Jingle(int id, double seconds);
+    void PlayRoomMusic();
+    int room_bgm = -1;                   // music id of the current room
+    int playing_bgm = -1;                // music id last sent to the driver
+    double jingle_time = 0.0;            // s left of a fanfare; the room music resumes after it
     std::function<void(const std::string&)> message_cb;
     double message_time = 0.0;
     // Combat
@@ -348,11 +576,27 @@ private:
     bool dead = false;
     std::shared_ptr<EntityTable> entity_table;
     SDL_Texture* blocks = nullptr;
+    SDL_Texture* blocks_priority = nullptr;   // only the priority tiles: drawn over the sprites
+    std::vector<char> block_has_priority;     // per block index: blocks_priority has pixels for it
+    // A block with priority tiles and what it shows: the nearest cell (x + y) and its height.
+    // Such a block hides a sprite standing behind it (a smaller x + y) lower than its top.
+    struct PriorityBlock
+    {
+        double depth;        // x + y of the cell it shows
+        int z;               // height slice it shows
+        bool wall;           // a vertical face (the cell is higher than the slice), not a top
+        SDL_FRect src, dst;  // in blocks_priority, on screen
+    };
+    void BuildPriorityBlocks(const std::vector<int>& layer, int layer_offset_tiles,
+                             std::vector<PriorityBlock>& out) const;
+    static bool PriorityHides(const PriorityBlock& b, double sprite_depth, double sprite_z,
+                              const SDL_FRect& sprite_rect);
 
     int cursor_x = 0, cursor_y = 0;      // world cell containing the player
     double player_x = 0, player_y = 0;   // player position, world cells (cell centre = +0.5)
     double player_z = 0;                 // height units; 1 unit = HEIGHT_UNIT_PX pixels
     double vertical_speed = 0;           // + up
+    double air_peak = -1e9;              // highest z of the current jump / fall (for the landing sound)
     bool grounded = true;
     bool moving = false;
     std::string blocked_text;            // why the last move attempt failed (shown in the status)
@@ -370,6 +614,9 @@ private:
     double camera_x = 0, camera_y = 0;   // room pixel (unscaled) shown at the viewport's top-left
     bool camera_snap = true;             // jump to the target instead of easing (room load, zoom)
     double frame_dt = 0.0;
+    // Play-test bot: when set, these directions replace the keyboard.
+    bool bot_input = false;
+    int bot_dx = 0, bot_dy = 0;
 };
 
 #endif // _ROOM_VIEW_H_

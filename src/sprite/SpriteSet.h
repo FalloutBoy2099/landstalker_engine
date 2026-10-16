@@ -37,7 +37,7 @@ public:
 
     // Draws a frame with its anchor at (x, y) on screen.
     void Draw(SDL_Renderer* renderer, const std::string& frame, float x, float y,
-              float scale = 1.0f, bool hflip = false) const;
+              float scale = 1.0f, bool hflip = false, SDL_Color tint = { 255, 255, 255, 255 }) const;
 
 private:
     std::string name;
