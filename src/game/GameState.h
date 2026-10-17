@@ -174,6 +174,8 @@ public:
         return true;
     }
     void HealFull() { health = max_health; }
+    // Playtest aid: sets the maximum health (in hearts) and fills it.
+    void SetMaxHealthHearts(int hearts) { max_health = std::clamp(hearts, START_HEALTH, MAX_HEALTH_CAP) * 256; health = max_health; }
     void Heal(double amount) { health = std::min(max_health, health + static_cast<int>(std::lround(amount * 256.0))); }
     int GetGold() const { return gold; }
 

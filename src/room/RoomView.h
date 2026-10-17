@@ -19,6 +19,7 @@
 #include "game/Behaviours.h"
 #include "game/Cutscenes.h"
 #include "game/Drops.h"
+#include "game/Triggers.h"
 #include <deque>
 #include "audio/SoundEngine.h"
 
@@ -57,6 +58,11 @@ struct RoomEntity
     int pending_gold = 0;     // dropped when the death animation ends
     double appear_t = -1.0;   // >= 0 while the entity materialises
     double act_t = -1.0;      // >= 0 while a boss plays its attack animation (s since it began)
+    bool pickable = false;    // Nigel can lift it (crates, vases...)
+    bool carried = false;     // Nigel holds it over his head
+    bool saved_solid = true;  // `solid` before it was picked up
+    bool thrown = false;      // flying after a throw
+    double tvx = 0.0, tvy = 0.0, thrown_t = 0.0;
     bool falls = false;       // gravity was switched on by its script: it drops until it rests on something
     double fall_v = 0.0;      // fall speed, height units / s
     bool dormant = false;  // a scripted enemy that has not been "made hostile" yet
@@ -136,6 +142,9 @@ public:
 
     // Loads a room. If arrival is given the cursor is placed there, otherwise at the map centre.
     void LoadRoom(int room_number, const SDL_Point* arrival = nullptr);
+    // Playtest aid: goes to a room, arriving by one of its doors (the first warp that leads there).
+    // False when the room does not exist.
+    bool GoToRoom(int number);
     void SetStatusCallback(std::function<void(const std::string&)> cb);
     // Shown for a few seconds after pickups and interactions ("" clears it).
     void SetMessageCallback(std::function<void(const std::string&)> cb) { message_cb = std::move(cb); }
@@ -191,6 +200,7 @@ public:
     bool IsMenuOpen() const { return menu_open; }
     // Re-evaluates which entities are shown after a story flag changed.
     void ApplyFlagRules();
+    void ApplyCustomRoomActions();
     void ApplyTileSwaps();
     // Sprite drawn at the cursor cell (the player). Without it only the debug cursor is shown.
     void SetPlayerSprite(std::shared_ptr<SpriteSet> sprite) { player = std::move(sprite); }
@@ -213,6 +223,22 @@ public:
     bool IsPlayerGrounded() const { return grounded; }
 
     int GetRoomNumber() const { return room_number; }
+    std::string DebugPos() const { char b[96]; std::snprintf(b, sizeof b, "player (%.2f,%.2f) z %.2f grounded %d support %d", player_x, player_y, player_z, grounded, support_entity); return b; }
+    // Why the player cannot move right now ("" when he is in control): a scripted scene, the intro,
+    // a dialogue, a faint... (shown by the playtest panel).
+    std::string ControlLockReason() const
+    {
+        if (dead) return "DEAD";
+        if (intro_active) return "INTRO";
+        if (fainted) return "FAINT";
+        if (input_locked) return "SCENE (input locked)";
+        if (!cutscene_ops.empty() || cutscene_busy > 0.0) return "CUTSCENE";
+        if (input_hold > 0.0) return "SCRIPTED (held)";
+        if (warp_pending || fx_level > 0.05) return "TRANSITION";
+        if (!dialogue_pages.empty()) return "DIALOGUE";
+        if (chest_open.active) return "CHEST";
+        return "";
+    }
     const std::vector<RoomWarp>& GetWarps() const { return warps; }
     // Raw heightmap cell for a world cell (-1 outside the heightmap).
     int GetCell(int world_x, int world_y) const;
@@ -245,6 +271,11 @@ private:
     // Highest floor under the player's box at (x, y) that can be reached from height z.
     double FloorUnder(double x, double y, double z) const;
     double PlatformTop(double x, double y, double z, int* index = nullptr) const;
+    bool IsPlatform(std::size_t i) const;
+    double EnemyFloor(std::size_t index) const;   // floor or low object under an enemy
+    bool SomeoneOn(std::size_t index) const;      // the player or an enemy stands on entity `index`
+    static constexpr double PLATFORM_STEP = 0.05;  // the player never steps onto an object: he must jump (only floor cells are climbed)
+    static constexpr double ENEMY_PLATFORM_STEP = 0.6;   // enemies do hop onto low objects (a pressure plate)
     static constexpr double LADDER_SPEED = 3.0;   // height units / s on a ladder
     static constexpr double FAINT_TIME = 5.0;   // s lying on the ground
     static constexpr double PLATFORM_TOLERANCE = 0.05;   // an object counts as a floor when its top is this close to the feet
@@ -261,6 +292,24 @@ private:
     void OnEntityGone(std::size_t index);
     void SetStoryFlag(int flag);
     void UseKey();
+    // Lifting crates and vases: Shift next to one lifts it over the head; Shift again on the ground sets it
+    // down in front, Shift in mid-air throws it. (The original: ProcessActionButton, code/gamelogic/gamelogic4.asm.)
+    static constexpr double LIFT_TIME = 0.4;        // 24 frames
+    static constexpr double CARRY_HEIGHT = 2.0;     // above the player's feet
+    int carried_entity = -1;
+    int lift_phase = 0;        // 0 none, 1 lifting, 2 putting down
+    double lift_t = 0.0;
+    double drop_x = 0.0, drop_y = 0.0, drop_z = 0.0;
+    bool TryPickUp();
+    void PutDownCarried();
+    void ThrowCarried();
+    void UpdateCarry(double dt);
+    void DropCarried();   // forgets what was held (room change)
+    void UseIdol();
+    void UpdateIdol(double dt);
+    static constexpr int ITEM_IDOL_STONE = 49;
+    std::vector<int> forced_swaps;   // tile swap triggers shown regardless of flags (the door half open)
+    double idol_t = 0.0;
     void UpdateChestOpening(double dt);
     void SpawnSparks(double x, double y, double z, bool big, bool hurt_player);
     // Shops and inns: yes / no questions answered with Y / N.
@@ -282,7 +331,10 @@ private:
     void UpdateEntityAnimations(double dt);
     void UpdateFallingEntities(double dt);
     bool TriggerHolds(int trigger, std::size_t index);
-    bool KillableEnemyExists() const;   // WaitForCondition of the behaviour scripts
+    bool KillableEnemyExists() const;
+    std::shared_ptr<Triggers> triggers;   // position / flag conditions (assets/text/triggers.txt)
+    int playback_seq = 0;                 // the recorded input sequence being replayed, 0 = none
+    int TriggerVar(int var, char size) const;   // WaitForCondition of the behaviour scripts
     int support_entity = -1;   // entity the player stands on, or -1
     double arrival_x = 0.0, arrival_y = 0.0;   // where the player entered the room (the raft warps wait until it is far from here)
     // The player faints (CSA_0000, the fall down the waterfall): he lies still for a while, then in
@@ -345,6 +397,7 @@ private:
     bool CanEnemyStandAt(std::size_t index, double x, double y, double z) const;
     void Die();
     bool IsAliveEnemy(std::size_t index) const;
+    static bool IsScriptedBall(int type);
     // Solid entities whose collision box overlaps the player box centred on (x, y).
     std::vector<int> OverlappingEntities(double x, double y, double z) const;
     int FloorHeight(int cell_x, int cell_y) const;
@@ -449,6 +502,7 @@ private:
     int menu_index = 0;                  // selected row
     std::vector<int> menu_items;         // item indices listed, in order
     std::vector<Dialogue::Page> dialogue_pages;   // boxes left to show, current one first
+    std::vector<int> dialogue_actions;            // custom script actions to run when the conversation ends
     const Json* dialogue_yes = nullptr;        // follow-ups when the last box is a question
     const Json* dialogue_no = nullptr;
     bool dialogue_asks = false;
@@ -506,6 +560,15 @@ private:
     double StartFx(const std::string& name);   // returns how long it takes
     void UpdateFx(double dt);
     // Friday: her overlay sprite in the cutscenes (flies in, hovers, flies off).
+    // Opening captions of the intro (SEGA ENTERPRISES PRESENTS...): 2 lines of 16 glyphs of the intro font.
+    struct IntroString { int x1 = 0, y1 = 0, x2 = 0, y2 = 0, frames = 0; std::vector<int> line1, line2; };
+    std::map<int, IntroString> intro_strings;
+    bool intro_strings_loaded = false;
+    int intro_caption = 0;            // the string on screen (0: none)
+    double intro_caption_t = 0.0;     // seconds left
+    SDL_Texture* intro_font = nullptr;
+    void ShowIntroString(int number);
+    void DrawIntroCaption(SDL_Renderer* renderer);
     int friday_state = 0;         // 0 hidden, 1 appearing, 2 hovering, 3 leaving
     double friday_t = 0.0;
     void DrawFriday(SDL_Renderer* renderer);
@@ -539,6 +602,7 @@ private:
     void FreeAnimations();
     void UpdateAnimations(double dt);
     int fall_dest = -1;        // room entered by falling into a pit cell (room.yaml fall_destination)
+    bool support_is_raft_ok() const;
     void CheckPit();           // standing on a pit: fall to the room below
     bool warp_pending = false;
     PendingWarp pending_warp{};

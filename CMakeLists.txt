@@ -62,3 +62,14 @@ endif()
 
 # Link to the actual SDL3 library.
 target_link_libraries(dds520 PRIVATE SDL3::SDL3)
+
+# Playtest build: the game on the left, a notes panel on the right (see src/playtest/PlaytestPanel.h).
+if(NOT EMSCRIPTEN)
+    add_executable(dds520_playtest WIN32)
+    get_target_property(DDS_SOURCES ${CMAKE_PROJECT_NAME} SOURCES)
+    target_sources(dds520_playtest PRIVATE ${DDS_SOURCES})
+    target_include_directories(dds520_playtest PRIVATE src third_party/nuked-opn2 third_party/z80)
+    target_compile_definitions(dds520_playtest PRIVATE PLAYTEST=1)
+    target_link_libraries(dds520_playtest PRIVATE SDL3::SDL3)
+    add_dependencies(dds520_playtest ${CMAKE_PROJECT_NAME})   # (the assets are copied once, by the main target)
+endif()

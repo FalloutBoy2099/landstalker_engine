@@ -33,6 +33,21 @@ public:
     }
 
     // Plays until the target room's boss is dead (or the time is up). Returns true on success.
+    // `targets`: rooms to reach one after the other, e.g. "180,592" (a room that holds a boss is
+    // finished when the boss is dead, any other when the bot has had its say there).
+    bool Run(const std::string& targets, double max_seconds)
+    {
+        for (std::size_t i = 0; i < targets.size();)
+        {
+            goals.push_back(std::atoi(targets.c_str() + i));
+            const auto comma = targets.find(',', i);
+            if (comma == std::string::npos) break;
+            i = comma + 1;
+        }
+        if (goals.empty()) goals.push_back(-1);
+        return Run(goals[0], max_seconds);
+    }
+
     bool Run(int target, double max_seconds)
     {
         goal_room = target;
@@ -47,10 +62,41 @@ public:
         r.bot_dx = r.bot_dy = 0;
         if (!finished)
         {
-            Log("state: locked %d intro %d busy %.2f fx %.2f warp_pending %d dialogue %zu cutscene_ops %zu", r.input_locked, r.intro_active,
-                r.cutscene_busy, r.fx_level, r.warp_pending, r.dialogue_pages.size(), r.cutscene_ops.size());
+            Log("state: locked %d intro %d busy %.2f fx %.2f warp_pending %d dialogue %zu cutscene_ops %zu fainted %d hold %.1f dead %d menu %d chest %d swinging %d", r.input_locked, r.intro_active,
+                r.cutscene_busy, r.fx_level, r.warp_pending, r.dialogue_pages.size(), r.cutscene_ops.size(), r.fainted, r.input_hold, r.dead, r.menu_open, r.chest_open.active, r.swinging);
             Log("player (%.2f,%.2f) z %.2f grounded %d support %d cell %04X floor %d blocked: %s", r.player_x, r.player_y, r.player_z, r.grounded,
                 r.support_entity, r.GetCell(r.cursor_x, r.cursor_y), r.FloorHeight(r.cursor_x, r.cursor_y), r.blocked_text.c_str());
+            int cxd = r.cursor_x, cyd = r.cursor_y;
+            if (const char* dump = std::getenv("LS_BOT_DUMPXY")) std::sscanf(dump, "%d,%d", &cxd, &cyd);
+            {
+                std::map<std::pair<int, int>, double> plat0;
+                const auto blocked0 = EntityCells(-1, plat0);
+                if (std::getenv("LS_BOT_DUMPXY"))
+                {
+                    auto pth = Search([&](int x, int y) { return x == cxd && y == cyd; }, -1);
+                    std::string ps;
+                    for (const auto& c : pth) ps += "(" + std::to_string(c.first) + "," + std::to_string(c.second) + ")";
+                    Log("  search to dump cell: %zu cells %s", pth.size(), ps.c_str());
+                }
+                Log("  dump cell (%d,%d): blocked %d plat %d; steps from N/S/E/W neighbours:", cxd, cyd, (int)blocked0.count({ cxd, cyd }), (int)plat0.count({ cxd, cyd }));
+                static const int ndx0[4] = { -1, 0, 1, 0 }, ndy0[4] = { 0, -1, 0, 1 };
+                for (int k = 0; k < 4; ++k)
+                    Log("    from (%d,%d) kind %d walkable %d type %02X dest blocked %d", cxd + ndx0[k], cyd + ndy0[k],
+                        StepKind(cxd + ndx0[k], cyd + ndy0[k], cxd, cyd, plat0), (int)r.IsWalkable(cxd + ndx0[k], cyd + ndy0[k]),
+                        r.GetCell(cxd + ndx0[k], cyd + ndy0[k]) & 0x3F, (int)blocked0.count({ cxd + ndx0[k], cyd + ndy0[k] }));
+            }
+            for (int ddy = -2; ddy <= 3; ++ddy)
+            {
+                std::string row;
+                for (int ddx2 = -5; ddx2 <= 2; ++ddx2)
+                {
+                    const int qx = cxd + ddx2, qy = cyd + ddy;
+                    char b[24];
+                    std::snprintf(b, sizeof b, "%s%d.%02X ", InRoom(qx, qy) && r.IsWalkable(qx, qy) ? "" : "#", InRoom(qx, qy) ? r.FloorHeight(qx, qy) : -1, InRoom(qx, qy) ? r.GetCell(qx, qy) & 0x3F : 0);
+                    row += b;
+                }
+                Log("  y%d: %s", cyd + ddy, row.c_str());
+            }
             for (std::size_t i = 0; i < r.entities.size(); ++i)
             {
                 const auto& e = r.entities[i];
@@ -76,6 +122,19 @@ private:
     static constexpr double DT = 1.0 / 60.0;
     double time = 0.0;
     int goal_room = -1;
+    std::vector<int> goals;
+    std::size_t goal_idx = 0;
+    double goal_arrived = -1.0;
+
+    // The current goal is done: on to the next one, or finish.
+    void AdvanceGoal()
+    {
+        Log("goal room %d done", goal_room);
+        goal_arrived = -1.0;
+        boss_seen = false;
+        if (goal_idx + 1 < goals.size()) { goal_room = goals[++goal_idx]; tour_room = -1; Log("next goal: room %d", goal_room); }
+        else finished = true;
+    }
     bool finished = false;
     int deaths = 0;
 
@@ -93,6 +152,10 @@ private:
     std::map<std::tuple<int, int, int>, int> talk_tries;
     std::set<std::pair<int, int>> bad_targets;               // (room, entity) that cannot be reached
     double next_key = 0.0;       // earliest time of the next key press
+    std::pair<int, int> step_off{ -1, -1 };   // where to step to leave a doorway the player stands in
+    int step_off_room = -1;
+    int nudge_ticks = 0, nudge_dx = 0, nudge_dy = 0;   // a few ticks of sliding sideways before opening a chest
+    double last_tick_log = 0.0;
     double last_progress = 0.0;  // last time the player moved or something happened
     double last_x = 0, last_y = 0;
     int stuck_count = 0;
@@ -126,6 +189,9 @@ private:
         for (char c : s) out += (c == '\n') ? ' ' : c;
         return out.size() > 150 ? out.substr(0, 150) + "..." : out;
     }
+
+    // The room whose warps the current one uses (a flag-dependent version of a room counts as the original).
+    int Cur() const { return r.OriginalRoom(r.room_number); }
 
     // ---- the warp graph ----
     void BuildGraph()
@@ -193,16 +259,20 @@ private:
     std::set<std::pair<int, int>> EntityCells(int ignore, std::map<std::pair<int, int>, double>& plat) const
     {
         std::set<std::pair<int, int>> out;
+        over_cache.clear();
         if (!r.entity_table) return out;
         for (std::size_t i = 0; i < r.entities.size(); ++i)
         {
             const auto& e = r.entities[i];
             if (static_cast<int>(i) == ignore) continue;
             if (!e.solid || !e.visible || !r.entity_table->Has(e.type) || e.type >= 0xC0) continue;
-            if (r.IsAliveEnemy(i)) continue;
+            const auto* stats0 = r.entity_table->GetEnemy(e.type);
+            const bool still_hazard = r.IsAliveEnemy(i) && stats0 && stats0->health == 255 && e.behaviour == 0;   // a motionless spiked ball: walked around
+            if (r.IsAliveEnemy(i) && !still_hazard) continue;
             if (g->IsCollected(r.room_number, static_cast<int>(i))) continue;
-            const bool platform = !e.hostile && !e.talks && !e.dying && !r.entity_table->GetEnemy(e.type);
-            const double half = r.entity_table->GetHitboxBase(e.type) / 16.0;
+            const auto* stats = r.entity_table->GetEnemy(e.type);
+            const bool platform = !e.hostile && !e.talks && !e.dying && (!stats || stats->health == 255);
+            const double half = r.entity_table->GetHitboxBase(e.type) / 16.0 + (still_hazard ? 0.25 : 0.0);
             const double top = e.z + r.entity_table->GetHitboxHeight(e.type) / 16.0;
             const int x0 = static_cast<int>(std::floor(e.x - half - RoomView::PLAYER_RADIUS));
             const int x1 = static_cast<int>(std::floor(e.x + half + RoomView::PLAYER_RADIUS));
@@ -216,8 +286,12 @@ private:
                     if (std::abs(x + 0.5 - e.x) < half + RoomView::PLAYER_RADIUS &&
                         std::abs(y + 0.5 - e.y) < half + RoomView::PLAYER_RADIUS)
                     {
-                        if (platform) { auto& t = plat[{ x, y }]; t = std::max(t, top); }
-                        else if (H(x, y) < top && H(x, y) + RoomView::PLAYER_HEIGHT > e.z) out.insert({ x, y });
+                        if (e.z < H(x, y) + RoomView::PLAYER_HEIGHT)   // an object overhead (a raised block) is no obstacle
+                        {
+                            if (platform) { auto& t = plat[{ x, y }]; t = std::max(t, top); }
+                            else if (H(x, y) < top && H(x, y) + RoomView::PLAYER_HEIGHT > e.z) out.insert({ x, y });
+                        }
+                        else if (platform && top > H(x, y)) { auto& t = over_cache[{ x, y }]; t = std::max(t, top); }   // a bridge over the floor
                     }
                 }
         }
@@ -232,14 +306,30 @@ private:
     }
 
     // The kind of step from one cell to a neighbour: 0 impossible, 1 walk, 2 jump.
-    int StepKind(int cx, int cy, int nx, int ny, const std::map<std::pair<int, int>, double>& plat) const
+    mutable std::map<std::pair<int, int>, double> over_cache;   // platforms hovering over the floor of a cell (bridges): their top
+
+    int StepKind(int cx, int cy, int nx, int ny, const std::map<std::pair<int, int>, double>& plat, double from_at_least = -1e9) const
     {
-        const double from = Eff(cx, cy, plat), to = Eff(nx, ny, plat);
+        return StepKind1(std::max(Eff(cx, cy, plat), from_at_least), cx, cy, nx, ny, Eff(nx, ny, plat), plat, -1e9);
+    }
+
+    // Standing height of cell (x, y) on layer 0 (the floor or an object on it) or 1 (a bridge hovering over the floor).
+    double LayerH(int x, int y, int layer, const std::map<std::pair<int, int>, double>& plat) const
+    {
+        if (layer == 0) return Eff(x, y, plat);
+        const auto it = over_cache.find({ x, y });
+        return it == over_cache.end() ? Eff(x, y, plat) : it->second;
+    }
+
+    int StepKind1(double from, int cx, int cy, int nx, int ny, double to, const std::map<std::pair<int, int>, double>& plat, double) const
+    {
+        (void)cx; (void)cy;
         const bool on_object = plat.count({ nx, ny }) && to > H(nx, ny) + 1e-6;
         const double rise = to - from;
         if (rise <= 1e-6) return 1;
         if (!on_object) return rise <= 1.0 + 1e-6 ? 1 : rise <= 2.0 + 1e-6 ? 2 : 0;
-        return rise <= 1.3 ? 2 : 0;   // objects are not stepped on: jump
+        if (rise <= 0.06) return 1;   // (the player no longer steps onto an object: a button needs a jump)
+        return rise <= 1.3 ? 2 : 0;   // higher ones need a jump
     }
 
     // Breadth-first search from the player's cell to the nearest cell satisfying `goal`.
@@ -253,52 +343,75 @@ private:
         std::map<std::pair<int, int>, double> plat;
         const auto blocked = EntityCells(ignore_entity, plat);
         plat_cache = plat;
+        // doorways are only entered on purpose
+        std::set<std::pair<int, int>> doorway;
+        for (const auto& w : r.warps)
+            for (int wx = w.x; wx < w.x + w.w; ++wx)
+                for (int wy = w.y; wy < w.y + w.h; ++wy) doorway.insert({ wx, wy });
         const int W = r.hm_width, Hh = r.hm_height;
-        std::vector<int> dist(static_cast<std::size_t>(W) * Hh, -1);
-        std::vector<int> from(static_cast<std::size_t>(W) * Hh, -1);
+        const std::size_t N = static_cast<std::size_t>(W) * Hh;
+        std::vector<int> from(N * 2, -1);
         auto idx = [&](int x, int y) { return (y - OFF) * W + (x - OFF); };
-        // Dijkstra-lite: jumps cost more, so use a small priority queue.
-        using Item = std::pair<int, int>;   // cost, cell index
+        // Dijkstra-lite: jumps cost more, so use a small priority queue. Nodes are (cell, layer): layer 1 is
+        // a bridge (a platform hovering over the floor of the cell), so a corridor under it stays a corridor.
+        using Item = std::pair<int, int>;   // cost, node (layer * N + cell index)
         std::vector<Item> heap;
         auto cmp = [](const Item& a, const Item& b) { return a.first > b.first; };
-        std::vector<int> best(static_cast<std::size_t>(W) * Hh, 1 << 30);
-        best[idx(sx, sy)] = 0;
-        heap.push_back({ 0, idx(sx, sy) });
+        std::vector<int> best(N * 2, 1 << 30);
+        int start_layer = 0;
+        {
+            const auto ov = over_cache.find({ sx, sy });
+            if (ov != over_cache.end() && r.player_z >= ov->second - 0.3) start_layer = 1;
+        }
+        const int start_node = static_cast<int>(N) * start_layer + idx(sx, sy);
+        best[start_node] = 0;
+        heap.push_back({ 0, start_node });
         int found = -1;
         static const int ddx[4] = { -1, 0, 1, 0 }, ddy[4] = { 0, -1, 0, 1 };
         while (!heap.empty())
         {
             std::pop_heap(heap.begin(), heap.end(), cmp);
-            const auto [cost, ci] = heap.back();
+            const auto [cost, node] = heap.back();
             heap.pop_back();
-            if (cost > best[ci]) continue;
+            if (cost > best[node]) continue;
+            const int layer = node / static_cast<int>(N), ci = node % static_cast<int>(N);
             const int cx = OFF + ci % W, cy = OFF + ci / W;
-            if (goal(cx, cy)) { found = ci; break; }
+            if (goal(cx, cy)) { found = node; break; }
             for (int d = 0; d < 4; ++d)
             {
                 const int nx = cx + ddx[d], ny = cy + ddy[d];
                 if (!InRoom(nx, ny) || !r.IsWalkable(nx, ny)) continue;
+                if (doorway.count({ nx, ny }) && !goal(nx, ny)) continue;
                 const int floor_type = r.GetCell(nx, ny) & 0x3F;
                 if (floor_type == 7 && !goal(nx, ny)) continue;   // a pit: only to fall on purpose
-                if ((floor_type == 0x10 || floor_type == 0x19 || floor_type == 0x29) && !goal(nx, ny)) continue;   // spikes, swamp, lava
-                if ((floor_type == 0x1A || floor_type == 0x26 || floor_type == 0x27) && goal(nx, ny) && !allow_locked_goal) continue;   // a locked door   // a pit: only to fall on purpose
+                const int hazard = (floor_type == 0x10 || floor_type == 0x19) ? 40 : floor_type == 0x29 ? 150 : 0;   // spikes, swamp, lava: crossed only when there is no other way
+                if ((floor_type == 0x1A || floor_type == 0x26 || floor_type == 0x27) && goal(nx, ny) && !allow_locked_goal) continue;   // a locked door
                 if (blocked.count({ nx, ny }) || (time < temp_block_until && temp_block.count({ nx, ny }))) continue;
-                const int kind = StepKind(cx, cy, nx, ny, plat);
-                if (kind == 0) continue;
-                const int step = kind == 1 ? 1 : 8;   // a jump costs more
-                const int ni = idx(nx, ny);
-                if (cost + step < best[ni])
+                // the first step starts from where the player really is (he may hover over a ledge's edge)
+                const bool at_start = cx == sx && cy == sy && search_start.first < 0;
+                const bool has_over = over_cache.count({ nx, ny }) > 0;
+                for (int nl = 0; nl <= (has_over ? 1 : 0); ++nl)
                 {
-                    best[ni] = cost + step;
-                    from[ni] = ci;
-                    heap.push_back({ cost + step, ni });
-                    std::push_heap(heap.begin(), heap.end(), cmp);
+                    const double from_h = std::max(LayerH(cx, cy, layer, plat), at_start ? r.player_z : -1e9);
+                    const double to_h = LayerH(nx, ny, nl, plat);
+                    if (nl == 1 && std::abs(from_h - to_h) > 2.0 + 1e-6) continue;   // a bridge is entered from its own level only (a jump up is fine)
+                    const int kind = StepKind1(from_h, cx, cy, nx, ny, to_h, plat, -1e9);
+                    if (kind == 0) continue;
+                    const int step = (kind == 1 ? 1 : 8) + hazard;   // a jump costs more
+                    const int ni = static_cast<int>(N) * nl + idx(nx, ny);
+                    if (cost + step < best[ni])
+                    {
+                        best[ni] = cost + step;
+                        from[ni] = node;
+                        heap.push_back({ cost + step, ni });
+                        std::push_heap(heap.begin(), heap.end(), cmp);
+                    }
                 }
             }
         }
         if (found < 0) return none;
         std::vector<std::pair<int, int>> cells;
-        for (int c = found; c >= 0; c = from[c]) cells.push_back({ OFF + c % W, OFF + c / W });
+        for (int c = found; c >= 0; c = from[c]) { const int ci = c % static_cast<int>(N); cells.push_back({ OFF + ci % W, OFF + ci / W }); }
         std::reverse(cells.begin(), cells.end());
         return cells;
     }
@@ -359,6 +472,7 @@ private:
         }
         int dx = 0, dy = 0;
         Decide(dx, dy);
+        Dodge(dx, dy);
         if (trace && time > 497.0 && time < 497.2) Log("decision dx %d dy %d, ferry stage %d, path %zu, hunt %d, player (%.3f,%.3f) knock %.2f hold %.2f", dx, dy, ferry.stage, path.size(), hunt, r.player_x, r.player_y, r.knock_time, r.input_hold);
         if (g->HasStatus(GameState::STATUS_CONFUSION) && !r.input_locked) { dx = -dx; dy = -dy; }
         r.bot_dx = dx;
@@ -378,6 +492,14 @@ private:
     // Logs what changed since the last tick.
     void Observe()
     {
+        if (std::getenv("LS_BOT_TICKS") && time - last_tick_log >= 10.0)
+        {
+            last_tick_log = time;
+            double ed0 = 0.0;
+            const int en = NearestEnemy(ed0);
+            Log("tick: pos (%.2f,%.2f) z %.2f hp %d/%d plan %s hunt %d enemy %d dist %.1f path %zu", r.player_x, r.player_y, r.player_z,
+                g->GetHealth(), g->GetMaxHealth(), plan_what.c_str(), hunt, en, ed0, path.size());
+        }
         if (r.room_number != seen_room)
         {
             seen_room = r.room_number;
@@ -391,12 +513,12 @@ private:
             extents.clear();
             extents_since.clear();
             ferry = Ferry();
-            ++recent_visits[seen_room];
-            entry_key = std::get<1>(cur_hop) == seen_room ? cur_hop : std::make_tuple(-1, -1, 0, 0);
+            ++recent_visits[Cur()];
+            entry_key = std::get<1>(cur_hop) == Cur() ? cur_hop : std::make_tuple(-1, -1, 0, 0);
             hunt = false;
-            if (!room_talkables.count(seen_room) && !(r.shop_info && r.shop_info->kind == "inn"))
+            if (!room_talkables.count(Cur()) && !(r.shop_info && r.shop_info->kind == "inn"))
             {
-                auto& list = room_talkables[seen_room];
+                auto& list = room_talkables[Cur()];
                 for (std::size_t i = 0; i < r.entities.size(); ++i)
                 {
                     const auto& e = r.entities[i];
@@ -409,7 +531,7 @@ private:
                 r.entities.size());
         }
         for (int f : g->GetFlags())
-            if (!seen_flags.count(f)) { seen_flags.insert(f); if (f < 4096) recent_visits.clear(); Log("FLAG %d (byte %d bit %d) set", f, f / 8, f % 8); }
+            if (!seen_flags.count(f)) { seen_flags.insert(f); if (f < 4096) { recent_visits.clear(); dead_edges.clear(); } Log("FLAG %d (byte %d bit %d) set", f, f / 8, f % 8); }
         for (const auto& [item, n] : g->GetItems())
             if (seen_items[item] != n) { Log("ITEM %d '%s': %d -> %d", item, g->ItemName(item).c_str(), seen_items[item], n); seen_items[item] = n; }
         if (g->GetGold() != seen_gold) { Log("GOLD %d -> %d", seen_gold, g->GetGold()); seen_gold = g->GetGold(); }
@@ -453,19 +575,89 @@ private:
         {
             if (!r.IsAliveEnemy(i)) continue;
             const auto& e = r.entities[i];
+            const auto* st = r.entity_table->GetEnemy(e.type);
+            if (st && st->health == 255) continue;   // indestructible (spiked balls): dodged, not fought
             const double d = std::hypot(e.x - r.player_x, e.y - r.player_y);
             if (d < dist) { dist = d; best = static_cast<int>(i); }
         }
         return best;
     }
 
+    // ---- indestructible hazards (the spiked balls of the Swamp Shrine): keep out of their way ----
+    struct Mover { double x = 0, y = 0, t = -1, vx = 0, vy = 0; };
+    std::map<int, Mover> movers;
+    double dodge_since = -1.0, dodge_off_until = -1.0;
+    int dodge_room = -1;
+
+    void Dodge(int& dx, int& dy)
+    {
+        if (!r.entity_table || r.input_locked || r.cutscene_busy > 0.0 || r.dead) return;
+        if (dodge_room != r.room_number) { dodge_room = r.room_number; movers.clear(); dodge_since = -1.0; }
+        struct Hz { double x, y, vx, vy, rad; };
+        std::vector<Hz> hz;
+        for (std::size_t i = 0; i < r.entities.size(); ++i)
+        {
+            if (!r.IsAliveEnemy(i)) continue;
+            const auto* st = r.entity_table->GetEnemy(r.entities[i].type);
+            if (!st || st->health != 255 || r.entities[i].behaviour == 0) continue;   // (motionless ones are planned around)
+            const auto& e = r.entities[i];
+            auto& m = movers[static_cast<int>(i)];
+            if (m.t < 0) { m.x = e.x; m.y = e.y; m.t = time; }
+            else if (time - m.t >= 0.1)
+            {
+                const double dt = time - m.t;
+                m.vx = (e.x - m.x) / dt;
+                m.vy = (e.y - m.y) / dt;
+                m.x = e.x; m.y = e.y; m.t = time;
+            }
+            if (std::hypot(e.x - r.player_x, e.y - r.player_y) > 6.0) continue;
+            hz.push_back({ e.x, e.y, m.vx, m.vy, r.entity_table->GetHitboxBase(e.type) / 16.0 + RoomView::PLAYER_RADIUS + 0.3 });
+        }
+        if (hz.empty()) { dodge_since = -1.0; return; }
+        auto danger = [&](int mx, int my) {
+            double worst = 1e9;
+            for (const auto& h : hz)
+                for (double t : { 0.0, 0.2, 0.4, 0.6 })
+                {
+                    const double len = (mx != 0 && my != 0) ? 0.7071 : 1.0;
+                    const double px = r.player_x + mx * len * RoomView::WALK_SPEED * t, py = r.player_y + my * len * RoomView::WALK_SPEED * t;
+                    worst = std::min(worst, std::hypot(px - (h.x + h.vx * t), py - (h.y + h.vy * t)) - h.rad);
+                }
+            return worst;   // < 0: would be touched
+        };
+        if (time < dodge_off_until) return;
+        if (danger(dx, dy) >= 0) { dodge_since = -1.0; return; }
+        if (dodge_since < 0) dodge_since = time;
+        if (time - dodge_since > 6.0) { dodge_off_until = time + 2.5; dodge_since = -1.0; return; }   // waited long enough: push through
+        static const int opt[9][2] = { { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { -1, -1 }, { 1, -1 }, { -1, 1 } };
+        double best = -1e9;
+        int bx = 0, by = 0;
+        for (const auto& o : opt)
+        {
+            if (o[0] != 0 || o[1] != 0)
+            {
+                // do not walk into a wall / off a ledge
+                const double nx = r.player_x + o[0] * 0.6, ny = r.player_y + o[1] * 0.6;
+                const int cx = static_cast<int>(std::floor(nx)), cy = static_cast<int>(std::floor(ny));
+                if (!InRoom(cx, cy) || !r.IsWalkable(cx, cy)) continue;
+                const int ft = r.GetCell(cx, cy) & 0x3F;
+                if (ft == 7 || ft == 0x10 || ft == 0x19 || ft == 0x29) continue;
+                if (H(cx, cy) > r.player_z + 0.8) continue;
+            }
+            double score = std::min(danger(o[0], o[1]), 1.5) * 4.0 + (o[0] * dx + o[1] * dy) * 0.8 - ((o[0] != 0 || o[1] != 0) ? 0.0 : 0.3);
+            if (score > best) { best = score; bx = o[0]; by = o[1]; }
+        }
+        dx = bx; dy = by;
+    }
+
     void Decide(int& dx, int& dy)
     {
         dx = dy = 0;
         if (!g || !r.entity_table) return;
+        if (std::getenv("LS_BOT_STAND")) return;   // test aid: the player just stands where he arrived
 
         // ---- finished? ----
-        if (r.room_number == goal_room)
+        if (Cur() == goal_room)
         {
             bool boss_alive = false;
             for (std::size_t i = 0; i < r.entities.size(); ++i)
@@ -477,8 +669,17 @@ private:
         if (r.dead)
         {
             ++deaths;
-            Log("DEAD (hp 0). Respawn #%d", deaths);
+            Log("DEAD (hp 0) at (%.2f,%.2f) z %.2f. Respawn #%d", r.player_x, r.player_y, r.player_z, deaths);
+            for (std::size_t i = 0; i < r.entities.size(); ++i)
+            {
+                const auto& e = r.entities[i];
+                if (!e.hostile || !e.visible || std::hypot(e.x - r.player_x, e.y - r.player_y) > 3.5) continue;
+                Log("  near #%zu type %d at (%.2f,%.2f,z %.1f) dist %.2f behaviour %d dying %d", i, e.type, e.x, e.y, e.z,
+                    std::hypot(e.x - r.player_x, e.y - r.player_y), e.behaviour, e.dying);
+            }
+            const double ax0 = r.arrival_x, ay0 = r.arrival_y;
             r.Respawn();
+            Log("respawned in room %d: arrival (%.2f,%.2f) -> player (%.2f,%.2f) z %.2f cursor (%d,%d) church %d", r.room_number, ax0, ay0, r.player_x, r.player_y, r.player_z, r.cursor_x, r.cursor_y, r.church_room);
             aim.active = false;
             path.clear();
             return;
@@ -525,10 +726,19 @@ private:
         {
             hunt = false;   // the room is cleared: the ways out may be open now
             for (auto it = dead_edges.begin(); it != dead_edges.end();)
-                it = std::get<0>(it->first) == r.room_number ? dead_edges.erase(it) : std::next(it);
+                it = std::get<0>(it->first) == Cur() ? dead_edges.erase(it) : std::next(it);
             Log("room cleared");
+            temp_block.clear();
+            temp_block_until = time + 5.0;   // gates take a moment to open: wait before judging the way shut
         }
-        if (enemy >= 0 && (ed < 5.0 || hunt))
+        if (enemy >= 0 && ed < 5.0)
+        {
+            Fight(enemy, ed, dx, dy);
+            return;
+        }
+        // floor buttons first: they are usually what opens the way
+        if (TryButtons(dx, dy)) return;
+        if (enemy >= 0 && hunt)
         {
             Fight(enemy, ed, dx, dy);
             return;
@@ -540,6 +750,7 @@ private:
         // ---- open chests and talk ----
         if (TryInteract(dx, dy)) return;
         if (TryUnlock(dx, dy)) return;
+        if (TryIdol(dx, dy)) return;
 
         // ---- go on towards the goal ----
         GoToGoal(dx, dy);
@@ -561,6 +772,14 @@ private:
             // walk towards it by path (so that walls are respected)
             auto cells = Search([&](int x, int y) { return std::hypot(x + 0.5 - e.x, y + 0.5 - e.y) <= 1.2 && std::abs(H(x, y) - e.z) <= 1.2; }, enemy);
             if (cells.size() >= 2) { path = cells; MoveAlong(dx, dy, "to an enemy"); return; }
+            if (cells.size() == 1 && other_level)
+            {
+                // already on the right cell but still up on the ledge's edge: walk to the cell's middle and drop
+                const double tx = cells[0].first + 0.5, ty = cells[0].second + 0.5;
+                if (std::abs(tx - r.player_x) > 0.1) dx = tx > r.player_x ? 1 : -1;
+                else if (std::abs(ty - r.player_y) > 0.1) dy = ty > r.player_y ? 1 : -1;
+                return;
+            }
             if (cells.empty())
             {
                 // No way to it (it floats over a gap, or lives on another level): go to the nearest
@@ -799,6 +1018,73 @@ private:
         return false;
     }
 
+    // ---- floor buttons: low objects whose script waits for somebody standing on them ----
+    std::set<std::pair<int, int>> pressed;   // (room, entity)
+    double pressing_since = -1.0;
+
+    bool IsButton(std::size_t i) const
+    {
+        if (!r.IsPlatform(i) || !r.behaviours) return false;
+        const auto& e = r.entities[i];
+        const auto* script = r.behaviours->Script(e.behaviour);
+        if (!script || script->size() < 2 || (*script)[0] != 0x36 || (*script)[1] != 1) return false;
+        return r.entity_table->GetHitboxHeight(e.type) / 16.0 <= 0.6;
+    }
+
+    bool TryButtons(int& dx, int& dy)
+    {
+        if (std::getenv("LS_BOT_TRACE") && std::fmod(time, 20.0) < DT)
+            for (std::size_t i = 0; i < r.entities.size(); ++i) if (IsButton(i)) Log("button candidate #%zu pressed=%d", i, static_cast<int>(pressed.count({ r.room_number, static_cast<int>(i) })));
+        for (std::size_t i = 0; i < r.entities.size(); ++i)
+        {
+            if (!IsButton(i) || pressed.count({ r.room_number, static_cast<int>(i) })) continue;
+            const auto& e = r.entities[i];
+            if (r.support_entity == static_cast<int>(i))
+            {
+                if (pressing_since < 0) { pressing_since = time; Log("steps on the button #%d (type %d)", static_cast<int>(i), e.type); }
+                last_progress = time;
+                if (time - pressing_since > 1.2) { pressed.insert({ r.room_number, static_cast<int>(i) }); pressing_since = -1.0; }
+                return true;
+            }
+            const int tx = static_cast<int>(std::floor(e.x)), ty = static_cast<int>(std::floor(e.y));
+            auto cells = Search([&](int x, int y) { return x == tx && y == ty; }, static_cast<int>(i));
+            if (cells.size() < 2) { if (cells.empty()) { if (logged_unreachable.insert({ r.room_number, 1000 + static_cast<int>(i) }).second) Log("cannot reach the button #%d at (%.1f,%.1f)", static_cast<int>(i), e.x, e.y); continue; } 
+                // on its cell already: step to the middle and wait for the player to settle on it
+                const double mx = tx + 0.5 - r.player_x, my = ty + 0.5 - r.player_y;
+                if (std::abs(mx) > 0.08) dx = mx > 0 ? 1 : -1; else if (std::abs(my) > 0.08) dy = my > 0 ? 1 : -1;
+                if (pressing_since < 0) { pressing_since = time; Log("on the button's cell: player (%.2f,%.2f,z %.3f) grounded %d support %d; button (%.2f,%.2f,z %.3f)", r.player_x, r.player_y, r.player_z, r.grounded, r.support_entity, e.x, e.y, e.z); }
+                last_progress = time;
+                if (time - pressing_since > 2.5) { pressed.insert({ r.room_number, static_cast<int>(i) }); pressing_since = -1.0; }
+                return true; }
+            path = cells;
+            MoveAlong(dx, dy, "to a button");
+            return true;
+        }
+        return false;
+    }
+
+    // The Idol Stone is held up in front of the Swamp Shrine's door (room 433, x <= 15, y 25..27).
+    double idol_wait = -1.0;
+    bool TryIdol(int& dx, int& dy)
+    {
+        if (g->ItemCount(RoomView::ITEM_IDOL_STONE) <= 0 || g->IsFlagSet(6) || r.room_number != 433) return false;
+        if (r.cursor_x <= 15 && r.cursor_y >= 25 && r.cursor_y <= 27 && r.grounded)
+        {
+            if (idol_wait < 0 || time - idol_wait > 6.0)
+            {
+                idol_wait = time;
+                Log("uses the Idol Stone at (%d,%d)", r.cursor_x, r.cursor_y);
+                Key(SDL_SCANCODE_I, 0.5);
+            }
+            return true;
+        }
+        auto cells = Search([&](int x, int y) { return x <= 15 && y >= 25 && y <= 27 && !(r.GetCell(x, y) & 0x4000); }, -1);
+        if (cells.size() < 2) return false;
+        path = cells;
+        MoveAlong(dx, dy, "to the shrine door");
+        return true;
+    }
+
     // With a Key in the bag: go and use it on the locked doors of the room (the player stands on the door's floor).
     bool TryUnlock(int& dx, int& dy)
     {
@@ -913,6 +1199,7 @@ private:
     bool Aiming(int& dx, int& dy)
     {
         if (aim.entity < 0 || static_cast<std::size_t>(aim.entity) >= r.entities.size()) { aim.active = false; return false; }
+        if (nudge_ticks > 0) { --nudge_ticks; dx = nudge_dx; dy = nudge_dy; if (nudge_ticks % 3 == 0) Log("  nudge pos (%.2f,%.2f)", r.player_x, r.player_y); return true; }
         FacingToDir(aim.facing, dx, dy);
         ++aim.ticks;
         if (aim.ticks > 12 && r.facing == aim.facing && r.grounded && r.knock_time <= 0.0)
@@ -942,6 +1229,15 @@ private:
                     {
                         const double ex = e.x - r.player_x, ey = e.y - r.player_y;
                         f2 = std::abs(ex) >= std::abs(ey) ? (ex < 0 ? 0 : 2) : (ey < 0 ? 1 : 3);
+                    }
+                    // (the chest may be off to one side of where we stand: slide towards it first)
+                    const double lat = (f2 % 2 == 0) ? e.y - r.player_y : e.x - r.player_x;
+                    if (std::abs(lat) > 0.3)
+                    {
+                        nudge_ticks = static_cast<int>((std::abs(lat) - 0.1) / (RoomView::WALK_SPEED * DT)) + 1;
+                        nudge_dx = (f2 % 2 == 0) ? 0 : (lat > 0 ? 1 : -1);
+                        nudge_dy = (f2 % 2 == 0) ? (lat > 0 ? 1 : -1) : 0;
+                        Log("nudges %d ticks (%d,%d), lateral %.2f", nudge_ticks, nudge_dx, nudge_dy, lat);
                     }
                     aim = { true, aim.entity, f2, 0, true };
                     return true;
@@ -988,13 +1284,13 @@ private:
     // The nearest other room (by warps) where somebody is worth talking to again.
     int PickTourRoom()
     {
-        std::map<int, int> dist{ { r.room_number, 0 } };
-        std::deque<int> q{ r.room_number };
+        std::map<int, int> dist{ { Cur(), 0 } };
+        std::deque<int> q{ Cur() };
         while (!q.empty())
         {
             const int u = q.front();
             q.pop_front();
-            if (u != r.room_number && !tour_done.count({ u, FlagSignature() }) && HasPendingTalk(u)) return u;
+            if (u != Cur() && !tour_done.count({ u, FlagSignature() }) && HasPendingTalk(u)) return u;
             for (const auto& e : graph[u])
             {
                 if (dist.count(e.to) || !visited.count(e.to)) continue;
@@ -1008,12 +1304,12 @@ private:
     void GoToGoal(int& dx, int& dy)
     {
         // The way on is closed, or we keep going round in circles: revisit people.
-        if (tour_room < 0 && r.room_number != goal_room && (!NextHop(r.room_number, goal_room) || recent_visits[r.room_number] >= 4))
+        if (tour_room < 0 && Cur() != goal_room && (!NextHop(Cur(), goal_room) || recent_visits[Cur()] >= 4))
         {
             tour_room = PickTourRoom();
             if (tour_room >= 0) Log("the way on is closed: goes back to room %d to talk again", tour_room);
         }
-        if (tour_room >= 0 && r.room_number == tour_room)
+        if (tour_room >= 0 && Cur() == tour_room)
         {
             // nothing left to say here (TryInteract found nothing): the tour of this room is over
             tour_done.insert({ tour_room, FlagSignature() });
@@ -1022,17 +1318,19 @@ private:
         }
         const int target_room = tour_room >= 0 ? tour_room : goal_room;
         if (pending_aim.active && path.size() < 2) { aim = pending_aim; pending_aim.active = false; Aiming(dx, dy); return; }
-        const Edge* hop = NextHop(r.room_number, target_room);
+        const Edge* hop = NextHop(Cur(), target_room);
         if (!hop)
         {
-            if (r.room_number == goal_room && tour_room < 0)
+            if (Cur() == goal_room && tour_room < 0)
             {
                 // Inside the goal room: look for the boss and wait for it (it fights us).
                 if (plan_what != "wait") { plan_what = "wait"; Log("in the goal room, waiting"); }
+                if (goal_arrived < 0) goal_arrived = time;
+                if (!boss_seen && time - goal_arrived > 8.0) { AdvanceGoal(); return; }
                 WanderToBoss(dx, dy);
                 return;
             }
-            if (plan_what != "noroute") { plan_what = "noroute"; Log("NO ROUTE from room %d to %d (dead edges %zu)", r.room_number, goal_room, dead_edges.size()); }
+            if (plan_what != "noroute") { plan_what = "noroute"; Log("NO ROUTE from room %d to %d (dead edges %zu)", Cur(), goal_room, dead_edges.size()); }
             Idle(dx, dy);
             return;
         }
@@ -1057,7 +1355,21 @@ private:
                 for (const auto& c : blocked) cells_blocked += "(" + std::to_string(c.first) + "," + std::to_string(c.second) + ")";
                 int reach = 0;
                 std::string far_cells;
-                Search([&](int x, int y) { ++reach; if (reach % 7 == 0 || reach < 40) far_cells += "(" + std::to_string(x) + "," + std::to_string(y) + ")"; return false; }, -1);
+                static const bool all_cells = std::getenv("LS_BOT_TICKS") != nullptr;
+                Search([&](int x, int y) { ++reach; if (all_cells || reach % 7 == 0 || reach < 40) far_cells += "(" + std::to_string(x) + "," + std::to_string(y) + ")"; return false; }, -1);
+                if (reach < 10)
+                    for (int ddy = -2; ddy <= 2; ++ddy)
+                    {
+                        std::string row;
+                        for (int ddx2 = -3; ddx2 <= 3; ++ddx2)
+                        {
+                            const int qx = r.cursor_x + ddx2, qy = r.cursor_y + ddy;
+                            char b[40];
+                            std::snprintf(b, sizeof b, "%s%04X ", InRoom(qx, qy) && r.IsWalkable(qx, qy) ? "" : "#", InRoom(qx, qy) ? r.GetCell(qx, qy) & 0xFFFF : 0);
+                            row += b;
+                        }
+                        Log("  y%d: %s", r.cursor_y + ddy, row.c_str());
+                    }
                 Log("reachable cells: %d %s; temp blocks %zu until %.1f (now %.1f)", reach, far_cells.c_str(), temp_block.size(), temp_block_until, time);
                 Log("cannot reach the warp to room %d at (%d,%d): giving the edge up [player cell (%d,%d) z %.2f; blocked by entities: %s]", hop->to,
                     hop->x, hop->y, r.cursor_x, r.cursor_y, r.player_z, cells_blocked.c_str());
@@ -1082,7 +1394,9 @@ private:
                 dead_edges[entry_key] = time;
                 Log("this entrance leads to a dead end: avoids it");
             }
-            else if (KillableEnemyExists())
+            else if (KillableEnemyExists() && (!NextHop(Cur(), goal_room) || [&] {
+                         for (const auto& e : r.entities) if ((e.type == 103 || e.type == 104) && e.visible) return true;
+                         return false; }()))   // no other way, or gates that open when the room is cleared: clear the room
             {
                 hunt = true;
                 Log("the way is shut and enemies are about: hunts them");
@@ -1092,7 +1406,9 @@ private:
         cur_hop = std::make_tuple(hop->from, hop->to, hop->x, hop->y);
         if (plan_what != "goto" + std::to_string(hop->to)) { plan_what = "goto" + std::to_string(hop->to); Log("heads for room %d via %s (%d,%d)", hop->to, hop->fall ? "a pit" : "the warp", hop->x, hop->y); }
         path = cells;
-        if (path.size() < 2 && hop->fall)
+        const bool centred = std::abs(r.cursor_x + 0.5 - r.player_x) <= 0.05 && std::abs(r.cursor_y + 0.5 - r.player_y) <= 0.05 &&
+                             std::abs(r.player_z - H(r.cursor_x, r.cursor_y)) <= 0.75;   // really standing in the doorway
+        if (path.size() < 2 && (hop->fall || (time - room_entered > 3.0 && !centred)))
         {
             // on the pit's edge: walk right in, to the cell's centre
             const double tx = r.cursor_x + 0.5, ty = r.cursor_y + 0.5;
@@ -1103,6 +1419,32 @@ private:
         if (path.size() < 2)
         {
             // already in the rectangle: step off and on again (the warp is armed by leaving)
+            // (to a walkable neighbour outside the rectangle, the one behind us first)
+            static const int ndx[4] = { -1, 0, 1, 0 }, ndy[4] = { 0, -1, 0, 1 };
+            std::map<std::pair<int, int>, double> plat;
+            const auto blocked = EntityCells(-1, plat);
+            if (step_off_room != r.room_number || (step_off.first == r.cursor_x && step_off.second == r.cursor_y)) step_off = { -1, -1 };
+            if (step_off.first >= 0 && std::abs(step_off.first - r.cursor_x) + std::abs(step_off.second - r.cursor_y) == 1)
+            {
+                path = { { r.cursor_x, r.cursor_y }, step_off };
+                MoveAlong(dx, dy, "off the warp");
+                return;
+            }
+            for (int k = 0; k < 4; ++k)
+            {
+                const int d = (((r.facing + 2) & 3) + k) & 3;
+                const int nx = r.cursor_x + ndx[d], ny = r.cursor_y + ndy[d];
+                if (!InRoom(nx, ny) || !r.IsWalkable(nx, ny) || blocked.count({ nx, ny })) continue;
+                if (nx >= hop->x && nx < hop->x + hop->w && ny >= hop->y && ny < hop->y + hop->h) continue;
+                if (StepKind(r.cursor_x, r.cursor_y, nx, ny, plat) != 1 || H(nx, ny) != H(r.cursor_x, r.cursor_y)) continue;   // level ground only
+                const int ft = r.GetCell(nx, ny) & 0x3F;
+                if (ft == 7 || ft == 0x10 || ft == 0x19 || ft == 0x29) continue;
+                path = { { r.cursor_x, r.cursor_y }, { nx, ny } };
+                step_off = { nx, ny };
+                step_off_room = r.room_number;
+                MoveAlong(dx, dy, "off the warp");
+                return;
+            }
             int fx = 0, fy = 0;
             FacingToDir((r.facing + 2) & 3, fx, fy);
             dx = fx; dy = fy;

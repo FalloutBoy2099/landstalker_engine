@@ -1,0 +1,38 @@
+CRASH: exception C0000005 at 00007FF9CD59ED85
+  access violation reading address 000001C4B35D4B38
+  SDL_aligned_free_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\stdlib\SDL_stdlib.c:565)
+  SDL_aligned_free_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\stdlib\SDL_stdlib.c:565)
+  SDL_DestroyAudioStream_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\audio\SDL_audiocvt.c:1535)
+  SoundEngine::~SoundEngine  (D:\Git\Landstalker\landstalker_engine\src\audio\SoundEngine.cpp:58)
+  RoomView::~RoomView  (D:\Git\Landstalker\landstalker_engine\src\room\RoomView.cpp:138)
+  RoomView::`scalar deleting destructor' +0x14
+  std::_Destroy_range<std::allocator<std::shared_ptr<IDrawable> > >  (C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\xmemory:1107)
+  `dynamic atexit destructor for 'drawables'' +0x23
+  execute_onexit_table +0x156
+  execute_onexit_table +0x7b
+  execute_onexit_table +0x34
+  exit +0x142
+  exit +0xcb
+  exit +0x6e
+  __scrt_common_main_seh  (D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_common.inl:295)
+  BaseThreadInitThunk +0x14
+  RtlUserThreadStart +0x21
+CRASH: exception C0000005 at 00007FF9D2E1ED85
+  access violation reading address 0000016260F8B1F8
+  SDL_aligned_free_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\stdlib\SDL_stdlib.c:565)
+  SDL_aligned_free_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\stdlib\SDL_stdlib.c:565)
+  SDL_DestroyAudioStream_REAL  (D:\Git\Landstalker\landstalker_engine\third_party\SDL\src\audio\SDL_audiocvt.c:1535)
+  SoundEngine::~SoundEngine  (D:\Git\Landstalker\landstalker_engine\src\audio\SoundEngine.cpp:58)
+  RoomView::~RoomView  (D:\Git\Landstalker\landstalker_engine\src\room\RoomView.cpp:138)
+  RoomView::`scalar deleting destructor' +0x14
+  std::_Destroy_range<std::allocator<std::shared_ptr<IDrawable> > >  (C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\xmemory:1107)
+  `dynamic atexit destructor for 'drawables'' +0x23
+  execute_onexit_table +0x156
+  execute_onexit_table +0x7b
+  execute_onexit_table +0x34
+  exit +0x142
+  exit +0xcb
+  exit +0x6e
+  __scrt_common_main_seh  (D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_common.inl:295)
+  BaseThreadInitThunk +0x14
+  RtlUserThreadStart +0x21

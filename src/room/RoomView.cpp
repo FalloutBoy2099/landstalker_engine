@@ -106,6 +106,8 @@ RoomView::RoomView(std::shared_ptr<Graphics> graphics, const std::filesystem::pa
         if (tline.empty() || tline[0] == '#' || std::sscanf(tline.c_str(), "%d %d %d", &t.from, &t.to, &t.flag) != 3) continue;
         transitions.push_back(t);
     }
+    try { triggers = std::make_shared<Triggers>(rooms_dir.parent_path() / "text" / "triggers.txt"); }
+    catch (const std::exception&) { /* the conditions are then always true */ }
     LoadRoom(room_number);
 }
 
@@ -132,6 +134,70 @@ RoomView::~RoomView()
     FreeEntityImages();
     if (blocks) SDL_DestroyTexture(blocks);
     if (blocks_priority) SDL_DestroyTexture(blocks_priority);
+    if (intro_font) SDL_DestroyTexture(intro_font);
+}
+
+// ---- Intro captions ------------------------------------------------------------------
+// code/blocks/loadisometricblocks2.asm: CheckAndDisplayIntroString. The lines are 16 sprites of 8x16 pixels at
+// the given sprite coordinates (screen position + 0x80) on the 320x224 screen; they stay `frames` frames.
+void RoomView::ShowIntroString(int number)
+{
+    if (!intro_strings_loaded)
+    {
+        intro_strings_loaded = true;
+        try
+        {
+            std::ifstream f(rooms_dir.parent_path() / "text" / "intro_strings.json", std::ios::binary);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            const Json root = Json::Parse(ss.str());
+            for (const auto& [key, v] : root.object)
+            {
+                IntroString s;
+                auto num = [&](const char* k) { const Json* j = v.Find(k); return j ? j->Int() : 0; };
+                s.x1 = num("x1"); s.y1 = num("y1"); s.x2 = num("x2"); s.y2 = num("y2"); s.frames = num("frames");
+                if (const Json* l = v.Find("line1")) for (const auto& g : l->array) s.line1.push_back(g.Int());
+                if (const Json* l = v.Find("line2")) for (const auto& g : l->array) s.line2.push_back(g.Int());
+                intro_strings[std::atoi(key.c_str())] = std::move(s);
+            }
+        }
+        catch (const std::exception&) {}
+    }
+    const auto it = intro_strings.find(number);
+    if (it == intro_strings.end()) return;
+    intro_caption = number;
+    intro_caption_t = it->second.frames / 60.0;
+}
+
+void RoomView::DrawIntroCaption(SDL_Renderer* renderer)
+{
+    if (intro_caption <= 0) return;
+    const auto it = intro_strings.find(intro_caption);
+    if (it == intro_strings.end()) return;
+    if (!intro_font)
+    {
+        if (SDL_Surface* surface = SDL_LoadPNG((rooms_dir.parent_path() / "graphics" / "fonts" / "introfont.png").string().c_str()))
+        {
+            intro_font = SDL_CreateTextureFromSurface(renderer, surface);
+            if (intro_font) SDL_SetTextureScaleMode(intro_font, SDL_SCALEMODE_NEAREST);
+            SDL_DestroySurface(surface);
+        }
+        if (!intro_font) { intro_caption = 0; return; }
+    }
+    const float k = viewport.w / 320.0f;   // the original screen is 320 pixels wide
+    const float top = viewport.y + (viewport.h - 224.0f * k) / 2.0f;
+    auto line = [&](const std::vector<int>& glyphs, int sx, int sy) {
+        for (std::size_t i = 0; i < glyphs.size(); ++i)
+        {
+            const int g = glyphs[i];
+            if (g <= 0) continue;
+            const SDL_FRect src = { static_cast<float>(g * 8), 0.0f, 8.0f, 16.0f };
+            const SDL_FRect dst = { viewport.x + (sx - 0x80 + static_cast<int>(i) * 8) * k, top + (sy - 0x80) * k, 8.0f * k, 16.0f * k };
+            SDL_RenderTexture(renderer, intro_font, &src, &dst);
+        }
+    };
+    line(it->second.line1, it->second.x1, it->second.y1);
+    line(it->second.line2, it->second.x2, it->second.y2);
 }
 
 std::vector<int> RoomView::LoadCsv(const std::filesystem::path& path, int base, int& cols, int& rows)
@@ -305,6 +371,8 @@ std::vector<RoomEntity> RoomView::LoadEntities(const std::filesystem::path& room
         {
             e.behaviour = std::stoi(body.substr(10));
         }
+        else if (body.rfind("pickable:", 0) == 0)
+            e.pickable = body.find("true") != std::string::npos;
         else if (body.rfind("gravity:", 0) == 0)
         {
             e.gravity = body.find("true") != std::string::npos;
@@ -358,6 +426,46 @@ void RoomView::LoadEntityImages(const std::filesystem::path& room_dir)
             SDL_SetTextureBlendMode(im.texture, SDL_BLENDMODE_BLEND);
         }
     }
+}
+
+bool RoomView::GoToRoom(int number)
+{
+    const int target = Redirect(number);
+    if (!RoomExists(target)) return false;
+    // arrival cells of every room, from the warp tables (built on first use)
+    static std::map<int, SDL_Point> arrivals;
+    if (arrivals.empty())
+    {
+        for (const auto& entry : std::filesystem::directory_iterator(rooms_dir))
+        {
+            if (entry.path().filename().string().rfind("room_", 0) != 0) continue;
+            try
+            {
+                for (const auto& w : LoadRawWarps(entry.path() / "room.yaml"))
+                {
+                    arrivals.emplace(w.room2, SDL_Point{ w.x2, w.y2 });   // coming from room1 into room2
+                    arrivals.emplace(w.room1, SDL_Point{ w.x1, w.y1 });   // coming back
+                }
+            }
+            catch (const std::exception&) {}
+        }
+    }
+    if (dead) Respawn();
+    // Whatever scene was running (the intro, a cutscene, a dialogue, a faint...) stops here.
+    cutscene_ops.clear();
+    cutscene_busy = 0.0; busy_then_warp = false; warp_pending = false;
+    fx_level = 0.0; fx_mode = FxMode::NONE;
+    input_locked = false; intro_active = false; input_hold = 0.0;
+    fainted = false; faint_warp = false; player_hidden = false; friday_state = 0;
+    knock_time = swing_time = attack_cooldown = 0.0; swinging = false;
+    chest_open = {};
+    dialogue_pages.clear(); dialogue_actions.clear(); dialogue_asks = false; choice_handler = nullptr;
+    if (dialogue_cb) dialogue_cb("", false);
+    const auto it = arrivals.find(OriginalRoom(target));
+    SDL_Point at{ 0, 0 };
+    if (it != arrivals.end()) { at = it->second; LoadRoom(target, &at); }
+    else LoadRoom(target);
+    return true;
 }
 
 bool RoomView::RoomExists(int number) const
@@ -616,6 +724,12 @@ void RoomView::LoadRoom(int number, const SDL_Point* arrival)
     blocks_priority = priority_tex;
     block_has_priority = std::move(new_block_priority);
     room_number = number;
+    forced_swaps.clear();
+    idol_t = 0.0;
+    carried_entity = -1; lift_phase = 0; lift_t = 0.0;
+    // Flags 8 to 15 (the second byte) are cleared by every room load, as in the original (LoadRoom_0):
+    // they hold what has happened in the room being visited (buttons pressed, enemies cleared).
+    if (game) for (int f = 8; f < 16; ++f) game->ClearFlag(f);
     fall_dest = kv.count("fall_destination") ? ToInt(kv, "fall_destination") : -1;
     climb_dest = kv.count("climb_destination") ? ToInt(kv, "climb_destination") : -1;
     room_max_height = kv.count("z_end") ? ToInt(kv, "z_end") : 0;
@@ -642,6 +756,7 @@ void RoomView::LoadRoom(int number, const SDL_Point* arrival)
     LoadEntityImages(dir);
     ApplyFlagRules();
     chest_contents = std::move(new_chests);
+    ApplyCustomRoomActions();
     room_characters = std::move(new_characters);
     dialogue_pages.clear();
     cutscene_ops.clear();
@@ -812,6 +927,7 @@ void RoomView::OnKeyDown(SDL_Scancode scancode, SDL_Keymod)
         Attack();
         break;
     case SDL_SCANCODE_K: UseKey(); break;
+    case SDL_SCANCODE_I: UseIdol(); break;
     case SDL_SCANCODE_F5: SaveGame(); break;
     case SDL_SCANCODE_F9: LoadGame(); break;
     case SDL_SCANCODE_Y: AnswerDialogue(true); break;
@@ -836,7 +952,7 @@ void RoomView::OnKeyDown(SDL_Scancode scancode, SDL_Keymod)
         break;
     case SDL_SCANCODE_LCTRL:
     case SDL_SCANCODE_RCTRL:
-        if (grounded && !(game && game->HasStatus(GameState::STATUS_PARALYSIS)))
+        if (grounded && lift_phase == 0 && !(game && game->HasStatus(GameState::STATUS_PARALYSIS)))
         {
             vertical_speed = JUMP_SPEED;
             grounded = false;
@@ -886,6 +1002,16 @@ bool RoomView::CanStandAt(double x, double y, double z) const
 // player can step onto from z.
 // Objects the player can stand on (crates, blocks, platforms): the highest top among the solid
 // inanimate entities under the player's box that is not above his feet.
+// Objects the player can stand on: solid, inanimate, not a character or an enemy.
+bool RoomView::IsPlatform(std::size_t i) const
+{
+    if (!entity_table || i >= entities.size()) return false;
+    const auto& e = entities[i];
+    if (!e.solid || !e.visible || e.hostile || e.talks || e.dying || e.type >= 0xC0 || !entity_table->Has(e.type)) return false;
+    if (const auto* st = entity_table->GetEnemy(e.type)) { if (st->health != 255) return false; }   // killable enemies are not floors; buttons, boulders, statues are
+    return !(game && game->IsCollected(room_number, static_cast<int>(i)));
+}
+
 double RoomView::PlatformTop(double x, double y, double z, int* index) const
 {
     double best = -1.0;
@@ -894,12 +1020,10 @@ double RoomView::PlatformTop(double x, double y, double z, int* index) const
     for (std::size_t i = 0; i < entities.size(); ++i)
     {
         const auto& e = entities[i];
-        if (!e.solid || !e.visible || e.hostile || e.talks || e.dying || e.type >= 0xC0 || !entity_table->Has(e.type)) continue;
-        if (entity_table->GetEnemy(e.type)) continue;
-        if (game && game->IsCollected(room_number, static_cast<int>(i))) continue;
+        if (!IsPlatform(i)) continue;
         const double half = entity_table->GetHitboxBase(e.type) / 16.0;
         const double top = e.z + entity_table->GetHitboxHeight(e.type) / 16.0;
-        if (top > z + PLATFORM_TOLERANCE || top <= best) continue;
+        if (top > z + PLATFORM_STEP || top <= best) continue;   // low objects (buttons, mats) are stepped onto
         if (std::abs(x - e.x) < half + PLAYER_RADIUS && std::abs(y - e.y) < half + PLAYER_RADIUS)
         {
             best = top;
@@ -945,6 +1069,7 @@ std::vector<int> RoomView::OverlappingEntities(double x, double y, double z) con
         if (game && game->IsCollected(room_number, static_cast<int>(i))) continue;
         const double half = entity_table->GetHitboxBase(e.type) / 16.0;
         const double top = e.z + entity_table->GetHitboxHeight(e.type) / 16.0;
+        if (top - z <= PLATFORM_STEP && IsPlatform(i)) continue;   // a low object: walked onto, not into
         if (std::abs(x - e.x) < half + PLAYER_RADIUS &&
             std::abs(y - e.y) < half + PLAYER_RADIUS &&
             z < top - 1e-3 && z + PLAYER_HEIGHT > e.z)
@@ -1049,6 +1174,9 @@ bool RoomView::Nudge(double fx, double fy, double max_step)
 }
 
 // An enemy is a hostile entity the table has stats for that has not been killed yet.
+// The spiked / grey balls and boulders are dangerous (hostile) but follow their script like any other object.
+bool RoomView::IsScriptedBall(int type) { return type == 19 || type == 20 || type == 73 || type == 74; }
+
 bool RoomView::IsAliveEnemy(std::size_t index) const
 {
     if (!game || !entity_table || index >= entities.size()) return false;
@@ -1079,7 +1207,7 @@ void RoomView::SpawnSparks(double x, double y, double z, bool big, bool hurt_pla
 void RoomView::Attack()
 {
     if (dead || chest_open.active || !dialogue_pages.empty() || attack_cooldown > 0.0 || swinging ||
-        !game || !entity_table) return;
+        carried_entity >= 0 || lift_phase != 0 || !game || !entity_table) return;
     if (game->HasStatus(GameState::STATUS_PARALYSIS))
     {
         // Struggling: each press has a growing chance of breaking free (1/3, 1/2, then sure).
@@ -1203,10 +1331,45 @@ bool RoomView::CanEnemyStandAt(std::size_t index, double x, double y, double z) 
         if (game && game->IsCollected(room_number, static_cast<int>(j))) continue;
         const double oh = entity_table->GetHitboxBase(o.type) / 16.0;
         const double otop = o.z + entity_table->GetHitboxHeight(o.type) / 16.0;
+        if (IsPlatform(j) && otop <= z + ENEMY_PLATFORM_STEP) continue;   // a button or a mat: walked onto (see EnemyFloor)
         if (std::abs(x - o.x) < half + oh && std::abs(y - o.y) < half + oh && z < otop && top > o.z)
             return false;
     }
     return true;
+}
+
+// Where an enemy stands: the floor, or the top of a low object (a pressure plate) under it.
+double RoomView::EnemyFloor(std::size_t index) const
+{
+    const auto& e = entities[index];
+    double f = static_cast<double>(FloorHeight(static_cast<int>(std::floor(e.x)), static_cast<int>(std::floor(e.y))));
+    for (std::size_t j = 0; j < entities.size(); ++j)
+    {
+        if (j == index || !IsPlatform(j)) continue;
+        const auto& o = entities[j];
+        const double oh = entity_table->GetHitboxBase(o.type) / 16.0;
+        const double otop = o.z + entity_table->GetHitboxHeight(o.type) / 16.0;
+        if (std::abs(e.x - o.x) < oh && std::abs(e.y - o.y) < oh && otop > f && otop <= std::max(e.z, f) + ENEMY_PLATFORM_STEP) f = otop;
+    }
+    return f;
+}
+
+// "Somebody is on this entity" (TA_01): the player, or any enemy standing on it.
+bool RoomView::SomeoneOn(std::size_t index) const
+{
+    if (support_entity == static_cast<int>(index)) return true;
+    if (index >= entities.size() || !entity_table) return false;
+    const auto& o = entities[index];
+    if (!entity_table->Has(o.type)) return false;
+    const double oh = entity_table->GetHitboxBase(o.type) / 16.0;
+    const double otop = o.z + entity_table->GetHitboxHeight(o.type) / 16.0;
+    for (std::size_t j = 0; j < entities.size(); ++j)
+    {
+        if (j == index || !IsAliveEnemy(j)) continue;
+        const auto& e = entities[j];
+        if (std::abs(e.x - o.x) < oh && std::abs(e.y - o.y) < oh && std::abs(e.z - otop) < 0.15) return true;
+    }
+    return false;
 }
 
 namespace { constexpr double LUNGE_TIME_ANIM = 0.7; }   // as LUNGE_TIME below
@@ -1545,6 +1708,7 @@ void RoomView::UpdateEnemies(double dt)
         if (e.hit_flash > 0.0) { e.walking = false; continue; }
         if (UpdateBoss(i, dt)) continue;
         if (e.speed <= 0) { e.walking = false; continue; }
+        if (e.behaviour > 0 && IsScriptedBall(e.type)) continue;   // the grey balls roll along their script (UpdateBehaviours)
 
         // Enemies swing when the player is within reach (the shooters, handled above, have
         // their own clock).
@@ -1600,9 +1764,7 @@ void RoomView::UpdateEnemies(double dt)
             }
             return false;
         };
-        auto floor_z = [&]() {
-            return static_cast<double>(FloorHeight(static_cast<int>(std::floor(e.x)), static_cast<int>(std::floor(e.y))));
-        };
+        auto floor_z = [&]() { return EnemyFloor(i); };
 
         switch (e.ai_state)
         {
@@ -1612,7 +1774,7 @@ void RoomView::UpdateEnemies(double dt)
             e.ai_time += dt;
             const double t = std::min(1.0, e.ai_time / LUNGE_TIME);
             if (EnemyMove(i, e.ai_vx * dt, e.ai_vy * dt, false)) moved = true;
-            e.z = floor_z() + std::sin(3.14159265 * t) * LUNGE_HEIGHT;
+            e.z = floor_z() + std::sin(3.14159265 * t) * (e.type >= 4 && e.type <= 6 ? 0.7 : LUNGE_HEIGHT);
             if (e.ai_time >= LUNGE_TIME)
             {
                 e.z = floor_z();
@@ -1673,11 +1835,11 @@ void RoomView::UpdateEnemies(double dt)
             if (dist > 0.3) moved = chase_step(speed * dt);
             if (e.gravity && e.ai_state == RoomEntity::AI_CHASE) e.z = floor_z();
             if ((kind == AiKind::LUNGER || kind == AiKind::MIMIC) && e.ai_cooldown <= 0.0 &&
-                dist > LUNGE_MIN && dist < LUNGE_MAX && (std::rand() % 1000) < (e.type == 159 ? 35 : 12))
+                dist > LUNGE_MIN && dist < (e.type >= 4 && e.type <= 6 ? 2.3 : LUNGE_MAX) && (std::rand() % 1000) < (e.type == 159 ? 35 : e.type >= 4 && e.type <= 6 ? 6 : 12))
             {
                 // Jump at the player along the axis that separates them most.
                 const double adx = std::abs(dx), ady = std::abs(dy);
-                const double reach = std::min(dist + 0.4, 3.2);
+                const double reach = std::min(dist + 0.4, e.type >= 4 && e.type <= 6 ? 1.9 : 3.2);   // (orcs only hop a short way)
                 const double speed_l = reach / LUNGE_TIME;
                 if (adx >= ady) { e.ai_vx = (dx > 0 ? 1 : -1) * speed_l; e.ai_vy = 0.0; e.orientation = dx > 0 ? 1 : 3; }
                 else { e.ai_vx = 0.0; e.ai_vy = (dy > 0 ? 1 : -1) * speed_l; e.orientation = dy > 0 ? 2 : 0; }
@@ -1982,7 +2144,20 @@ void RoomView::BehaviourTick(std::size_t index, bool& moved)
         case 0x0E: e.visible = e.base_visible = true; e.bh_pc += 1; continue;
         case 0x0F: e.visible = e.base_visible = false; e.bh_pc += 1; continue;
         case 0x44: e.visible = false; e.bh_pc += 1; continue;   // Hide
-        case 0x45: e.visible = true; e.bh_pc += 1; continue;    // ShowWhenCollisionClear
+        case 0x45:   // ShowWhenCollisionClear: appears (a gate closing behind the player) once the player is out of its box
+        {
+            if (!e.visible && entity_table && entity_table->Has(e.type))
+            {
+                const double half = entity_table->GetHitboxBase(e.type) / 16.0;
+                const double top = e.z + entity_table->GetHitboxHeight(e.type) / 16.0;
+                if (std::abs(player_x - e.x) < half + PLAYER_RADIUS && std::abs(player_y - e.y) < half + PLAYER_RADIUS &&
+                    player_z < top && player_z + PLAYER_HEIGHT > e.z)
+                    return;   // still in the way: try again next tick
+            }
+            e.visible = true;
+            e.bh_pc += 1;
+            continue;
+        }
         case 0x3E:   // HideSprite: the entity is gone for good
             e.visible = false;
             e.bh_pc = -1;
@@ -2104,6 +2279,15 @@ void RoomView::BehaviourTick(std::size_t index, bool& moved)
             e.dormant = false;
             e.bh_pc = -1;
             return;
+        case 0x49:   // ActivateSwitch: turned to the SW (its other picture) and a click
+            turn(2);
+            Sfx(0x74);
+            e.bh_pc += 1;
+            continue;
+        case 0x4A:   // ResetSwitch: back to the NE picture
+            turn(0);
+            e.bh_pc += 1;
+            continue;
         case 0x37:   // "Pause4s": plays an idle recording that keeps the player still for 254 frames
             input_hold = 254.0 / 60.0;
             e.bh_pc += 1;
@@ -2118,6 +2302,44 @@ void RoomView::BehaviourTick(std::size_t index, bool& moved)
             e.bh_pc = -1;
             return;
         }
+    }
+}
+
+// What the translated trigger routines can look at: the player's place, height and the story flags.
+int RoomView::TriggerVar(int var, char size) const
+{
+    const int cx = static_cast<int>(std::floor(player_x)), cy = static_cast<int>(std::floor(player_y));
+    const int subx = std::clamp(static_cast<int>((player_x - cx) * 16.0), 0, 15), suby = std::clamp(static_cast<int>((player_y - cy) * 16.0), 0, 15);
+    switch (var)
+    {
+    case Triggers::PX: return size == 'w' ? ((cx & 0xFF) << 8) | (cy & 0xFF) : cx;
+    case Triggers::PY: return cy;
+    case Triggers::PZ: { const int z = static_cast<int>(std::lround(player_z * 16.0)); return size == 'w' ? z : (z & 0xFF); }
+    case Triggers::SX: return size == 'w' ? (subx << 8) | suby : subx;
+    case Triggers::SY: return suby;
+    case Triggers::FH: return (FloorHeight(cx, cy) * 16) & 0xFF;
+    case Triggers::ROT:
+    {
+        static const int to_rot[4] = { 3, 0, 1, 2 };   // facing (NW NE SE SW) -> direction (NE SE SW NW)
+        return to_rot[facing & 3] << 6;
+    }
+    case Triggers::FALL: return grounded ? 0 : 1;
+    case Triggers::PLAYBACK:
+        // g_ControllerPlayback: the sequence being replayed, 0xFE once its last entry (the "hold") is
+        // reached or when a scene simply took the controls, 0 when the player has them.
+        if (playback && playback_index < playback->size())
+            return (*playback)[playback_index].second == 254 ? 0xFE : playback_seq;
+        if (input_hold > 0.0) return 9;
+        return input_locked ? 0xFE : 0;
+    default:
+        if (var >= Triggers::FLAG0 && game)
+        {
+            const int byte = var - Triggers::FLAG0;
+            int v = 0;
+            for (int b = 0; b < 8; ++b) if (game->IsFlagSet(byte * 8 + b)) v |= 1 << b;
+            return v;
+        }
+        return 0;
     }
 }
 
@@ -2155,10 +2377,10 @@ bool RoomView::TriggerHolds(int trigger, std::size_t index)
         StartShake(0.8, 2.0);
         return true;
     }
-    case 1:   // somebody (the player) stands on this entity
-        return support_entity == static_cast<int>(index);
+    case 1:   // somebody (the player, or an enemy) stands on this entity
+        return SomeoneOn(index);
     case 6: case 0x1E:   // nobody stands on this entity (a pressure plate that was released)
-        return support_entity != static_cast<int>(index);
+        return !SomeoneOn(index);
     case 2:   // no killable enemy is left in the room (doors that open once it is cleared)
         return !KillableEnemyExists();
     case 0x62:   // at least one killable enemy is there
@@ -2170,15 +2392,10 @@ bool RoomView::TriggerHolds(int trigger, std::size_t index)
                              !(game && game->IsCollected(room_number, static_cast<int>(i)));
         return !hostile || (game && game->IsFlagSet(0x0A * 8 + 3));
     }
-    case 7:   // the player is on row 15
-        return cursor_y == 15;
-    case 0x0D:   // row 34, floor of height 2
-        return cursor_y == 34 && FloorHeight(cursor_x, cursor_y) == 2;
-    case 0x0E:   // on the platform at (28..30, 19..21), height 4, not falling
-        return cursor_x >= 28 && cursor_x <= 30 && cursor_y >= 19 && cursor_y <= 21 && grounded && std::abs(player_z - 4.0) < 0.05;
-    case 0x5F:   // flags 8 to 11 are all set
-        return game && game->IsFlagSet(8) && game->IsFlagSet(9) && game->IsFlagSet(10) && game->IsFlagSet(11);
     default:
+        // everything else: the translated routine of the original, if there is one
+        if (triggers && triggers->Has(trigger))
+            return triggers->Evaluate(trigger, [this](int var, char size) { return TriggerVar(var, size); });
         return true;
     }
 }
@@ -2216,12 +2433,12 @@ void RoomView::UpdateBehaviours(double dt)
             // Enemies that wait for a story event (an ambush, a boss) sleep until their script
             // turns them hostile; the others are handled by the enemy AI.
             e.bh_init = true;
-            if (e.hostile && behaviours->IsScripted(e.behaviour)) e.dormant = true;
+            if (e.hostile && behaviours->IsScripted(e.behaviour) && !IsScriptedBall(e.type)) e.dormant = true;
             // A director whose scene was played (its flag is set) has nothing more to do.
             const int director_flag = behaviours->DirectorFlag(e.behaviour);
             if (!e.hostile && director_flag >= 0 && game && game->IsFlagSet(director_flag)) { e.bh_pc = -1; continue; }
         }
-        if ((e.hostile && !e.dormant) || e.bh_pc < 0) continue;
+        if ((e.hostile && !e.dormant && !IsScriptedBall(e.type)) || e.bh_pc < 0) continue;
         // Entities the table does not know (the invisible "directors" of cutscenes) still run.
         if (game && game->IsCollected(room_number, static_cast<int>(i))) continue;
         if (e.bh_speed <= 0) e.bh_speed = 1;
@@ -2542,11 +2759,13 @@ void RoomView::BeginNewGame()
     LoadRoom(139, &arrival);
     SetPlayerPosition(62.5, 24.5);
     Sfx(0x2B);   // the intro's music (Labyrinth)
+    ShowIntroString(1);
 }
 
 void RoomView::SkipIntro()
 {
     intro_active = false;
+    intro_caption = 0;
     input_locked = false;
     fx_level = 0.0; fx_mode = FxMode::NONE; cutscene_busy = 0.0; busy_then_warp = false; friday_state = 0;
     fainted = false; player_hidden = false; input_hold = 0.0; faint_warp = false;
@@ -2567,6 +2786,7 @@ void RoomView::SkipIntro()
 void RoomView::StartPlayback(int sequence)
 {
     playback = behaviours ? behaviours->PlaybackSequence(sequence) : nullptr;
+    playback_seq = playback ? sequence : 0;
     playback_index = 0;
     playback_timer = playback && !playback->empty() ? (*playback)[0].second / 60.0 : 0.0;
 }
@@ -2701,6 +2921,9 @@ void RoomView::ContinueCutscene()
             if (dur > 0.0) { cutscene_busy = dur; return; }
             break;
         }
+        case Cutscenes::Op::INTRO_STRING:
+            ShowIntroString(op.value);
+            break;
         case Cutscenes::Op::CREDITS:
             cutscene_ops.clear();
             if (credits_cb) credits_cb();
@@ -2927,12 +3150,15 @@ void RoomView::ApplyTileSwaps()
     heightmap = base_heightmap;
     if (!game) return;
 
+    std::vector<int> active;
     for (const auto& sf : swap_flags)
+        if (sf.always || game->IsFlagSet(sf.flag)) active.push_back(sf.trigger);
+    for (int t : forced_swaps) active.push_back(t);
+    for (int trigger : active)
     {
-        if (!sf.always && !game->IsFlagSet(sf.flag)) continue;
         const TileSwap* sw = nullptr;
         for (const auto& t : tile_swaps)
-            if (t.trigger == sf.trigger) { sw = &t; break; }
+            if (t.trigger == trigger) { sw = &t; break; }
         if (!sw) continue;
 
         const int dst_x = sw->map[2], dst_y = sw->map[3], src_x = sw->map[0], src_y = sw->map[1];
@@ -2982,6 +3208,23 @@ void RoomView::ApplyTileSwaps()
                 heightmap[dy * hm_width + dx] = hm_before[sy * hm_width + sx];
             }
         }
+    }
+}
+
+// Rooms the original rearranges by hand when it loads them (code/maps/customroomactions1.asm).
+// Only the ones the story has reached so far are ported.
+void RoomView::ApplyCustomRoomActions()
+{
+    if (!game) return;
+    if (room_number == 593 && game->IsFlagSet(7) && entities.size() >= 3)
+    {
+        // Massan mayor's house, after the player woke up: the scene's director is gone, the mayor
+        // stands by the bed and his daughter's place is taken (flag 4: she is back).
+        game->MarkCollected(room_number, 2);
+        entities[2].visible = entities[2].base_visible = false;
+        entities[0].x = 16.5; entities[0].y = 18.5;
+        entities[0].orientation = game->IsFlagSet(4) ? 1 : entities[0].orientation;
+        if (game->IsFlagSet(4)) { entities[1].x = 18.5; entities[1].y = 16.5; }
     }
 }
 
@@ -3043,8 +3286,16 @@ bool RoomView::StartDialogue()
         if (shop_info && shop_info->kind == "church" && game) return OfferChurch();
         if (!game || e.dialogue < 0 || e.dialogue >= static_cast<int>(room_characters.size())) continue;
         auto conv = dialogue_data->Begin(room_characters[e.dialogue], *game);
-        if (conv.pages.empty()) { for (int item : conv.give_now) GiveDialogueItem(item); continue; }
+        if (conv.pages.empty())
+        {
+            for (int item : conv.give_now) GiveDialogueItem(item);
+            if (conv.actions.empty()) continue;
+            ApplyFlagRules();
+            for (int action : conv.actions) TriggerAction(action);
+            return true;
+        }
         for (int item : conv.give_now) GiveDialogueItem(item);
+        dialogue_actions = std::move(conv.actions);
         dialogue_pages = std::move(conv.pages);
         dialogue_yes = conv.yes;
         dialogue_no = conv.no;
@@ -3247,6 +3498,12 @@ void RoomView::UseMenuItem()
         UseKey();
         return;
     }
+    else if (item == ITEM_IDOL_STONE)
+    {
+        CloseMenu();
+        UseIdol();
+        return;
+    }
     else if (item == 18 || item == 21 || item == 28 || item == 33 || item == 34)
     {
         if (CureAilmentsWith(item))
@@ -3277,6 +3534,35 @@ void RoomView::UseMenuItem()
         if (count > 0) menu_items.push_back(it);
     menu_index = std::clamp(menu_index, 0, std::max(0, static_cast<int>(menu_items.size()) - 1));
     RefreshMenu();
+}
+
+// The Idol Stone, held up in front of the door of the Swamp Shrine (room 433, cells x <= 15, y 25..27):
+// the ground rumbles, the door half opens, and a moment later it is open for good (flag 6).
+void RoomView::UseIdol()
+{
+    if (!game || dead || !dialogue_pages.empty() || idol_t > 0.0) return;
+    if (game->ItemCount(ITEM_IDOL_STONE) <= 0) return;
+    if (game->IsFlagSet(6) || room_number != 433 || cursor_x > 15 || cursor_y < 25 || cursor_y > 27)
+    {
+        Sfx(SoundEngine::SFX_ERROR);
+        ShowMessage("Nothing happens.");
+        return;
+    }
+    ShowMessage("Nigel held up the Idol Stone over the statue.");
+    Sfx(0x59);   // SND_Rumble
+    forced_swaps.push_back(0);
+    ApplyTileSwaps();
+    idol_t = 0.5;   // 30 frames
+}
+
+void RoomView::UpdateIdol(double dt)
+{
+    if (idol_t <= 0.0) return;
+    idol_t -= dt;
+    if (idol_t > 0.0) return;
+    forced_swaps.clear();
+    SetStoryFlag(6);
+    ApplyFlagRules();
 }
 
 // Using a Key on a locked door. As in the original the player stands on the door's floor
@@ -3425,7 +3711,10 @@ void RoomView::AdvanceDialogue()
         if (dialogue_cb) dialogue_cb("", false);
         page_wait = 0.0;
         ApplyFlagRules();
-        ContinueCutscene();
+        auto actions = std::move(dialogue_actions);
+        dialogue_actions.clear();
+        for (int action : actions) TriggerAction(action);
+        if (actions.empty() || (dialogue_pages.empty() && cutscene_busy <= 0.0)) ContinueCutscene();
     }
     else
     {
@@ -3452,6 +3741,7 @@ void RoomView::AnswerDialogue(bool yes)
     dialogue_yes = dialogue_no = nullptr;
     auto conv = dialogue_data->Follow(next, *game);
     dialogue_pages = std::move(conv.pages);
+    dialogue_actions = std::move(conv.actions);
     dialogue_yes = conv.yes;
     dialogue_no = conv.no;
     dialogue_asks = conv.asks;
@@ -3459,6 +3749,9 @@ void RoomView::AnswerDialogue(bool yes)
     {
         if (dialogue_cb) dialogue_cb("", false);
         ApplyFlagRules();
+        auto actions = std::move(dialogue_actions);
+        dialogue_actions.clear();
+        for (int action : actions) TriggerAction(action);
     }
     else
     {
@@ -3466,9 +3759,178 @@ void RoomView::AnswerDialogue(bool yes)
     }
 }
 
+// ---- Lifting ---------------------------------------------------------------------------
+bool RoomView::TryPickUp()
+{
+    if (!game || !entity_table || dead || !grounded || carried_entity >= 0 || swinging || chest_open.active) return false;
+    if (game->HasStatus(GameState::STATUS_CURSE)) return false;
+    static const double dir_x[4] = { -1, 0, 1, 0 };   // facing: NW NE SE SW
+    static const double dir_y[4] = { 0, -1, 0, 1 };
+    const double reach = PLAYER_RADIUS + 0.4;
+    const double qx = player_x + dir_x[facing] * reach, qy = player_y + dir_y[facing] * reach;
+    if (std::getenv("LS_LOG_LIFT"))
+    {
+        SDL_Log("TryPickUp: player (%.2f,%.2f,z %.2f) facing %d probe (%.2f,%.2f)", player_x, player_y, player_z, facing, qx, qy);
+        for (std::size_t i = 0; i < entities.size(); ++i)
+            if (entities[i].pickable) SDL_Log("  pickable #%zu type %d at (%.2f,%.2f,z %.2f) visible %d hostile %d talks %d", i, entities[i].type, entities[i].x, entities[i].y, entities[i].z, entities[i].visible, entities[i].hostile, entities[i].talks);
+    }
+    int best = -1;
+    double best_d = 1e9;
+    for (std::size_t i = 0; i < entities.size(); ++i)
+    {
+        const auto& e = entities[i];
+        // (the data also flags chests, stakes... as pickable: only these are lifted here: crate, vase, dog, chicken)
+        if (!e.pickable || (e.type != 22 && e.type != 17 && e.type != 14 && e.type != 15) || !e.visible || e.hostile || e.talks || e.dying || e.carried || e.thrown) continue;
+        if (!entity_table->Has(e.type) || game->IsCollected(room_number, static_cast<int>(i))) continue;
+        const double half = entity_table->GetHitboxBase(e.type) / 16.0 + 0.35;
+        if (std::abs(qx - e.x) > half || std::abs(qy - e.y) > half) continue;
+        const double top = e.z + entity_table->GetHitboxHeight(e.type) / 16.0;
+        if (player_z >= top || player_z + PLAYER_HEIGHT <= e.z || std::abs(player_z - e.z) > 0.8) continue;
+        const double d = std::hypot(qx - e.x, qy - e.y);
+        if (d < best_d) { best_d = d; best = static_cast<int>(i); }
+    }
+    if (best < 0) return false;
+    auto& e = entities[best];
+    carried_entity = best;
+    lift_phase = 1;
+    lift_t = 0.0;
+    e.carried = true;
+    e.saved_solid = e.solid;
+    e.solid = false;
+    e.falls = false;
+    Sfx(SoundEngine::SFX_CURSOR_SELECT);
+    return true;
+}
+
+void RoomView::PutDownCarried()
+{
+    if (carried_entity < 0 || lift_phase != 0 || static_cast<std::size_t>(carried_entity) >= entities.size()) return;
+    static const double dir_x[4] = { -1, 0, 1, 0 };
+    static const double dir_y[4] = { 0, -1, 0, 1 };
+    auto& e = entities[carried_entity];
+    const double half = entity_table ? entity_table->GetHitboxBase(e.type) / 16.0 : 0.5;
+    const double nx = player_x + dir_x[facing] * (PLAYER_RADIUS + half + 0.05);
+    const double ny = player_y + dir_y[facing] * (PLAYER_RADIUS + half + 0.05);
+    const int cx = static_cast<int>(std::floor(nx)), cy = static_cast<int>(std::floor(ny));
+    double z = FloorHeight(cx, cy);
+    const bool was_solid = e.solid;
+    e.solid = e.saved_solid;
+    const double platform = PlatformTop(nx, ny, player_z + 1.0 - PLATFORM_TOLERANCE, nullptr);
+    if (platform > z) z = platform;
+    const bool fits = z <= player_z + STEP_UP + 1e-6 && CanEnemyStandAt(static_cast<std::size_t>(carried_entity), nx, ny, z);
+    e.solid = was_solid;
+    if (!fits) { Sfx(SoundEngine::SFX_ERROR); return; }
+    drop_x = nx; drop_y = ny; drop_z = z;
+    lift_phase = 2;
+    lift_t = 0.0;
+}
+
+void RoomView::ThrowCarried()
+{
+    if (carried_entity < 0 || lift_phase != 0 || static_cast<std::size_t>(carried_entity) >= entities.size()) return;
+    static const double dir_x[4] = { -1, 0, 1, 0 };
+    static const double dir_y[4] = { 0, -1, 0, 1 };
+    auto& e = entities[carried_entity];
+    e.carried = false;
+    e.solid = e.saved_solid;
+    e.thrown = true;
+    e.thrown_t = 0.0;
+    e.tvx = dir_x[facing] * 7.0;
+    e.tvy = dir_y[facing] * 7.0;
+    e.falls = true;
+    e.fall_v = -3.0;   // a little lob upwards
+    carried_entity = -1;
+    Sfx(SoundEngine::SFX_JUMP);
+}
+
+void RoomView::DropCarried()
+{
+    if (carried_entity >= 0 && static_cast<std::size_t>(carried_entity) < entities.size())
+    {
+        auto& e = entities[carried_entity];
+        e.carried = false;
+        e.solid = e.saved_solid;
+    }
+    carried_entity = -1;
+    lift_phase = 0;
+    lift_t = 0.0;
+}
+
+// The held object follows Nigel; thrown ones fly, land, and vases shatter.
+void RoomView::UpdateCarry(double dt)
+{
+    if (carried_entity >= 0 && static_cast<std::size_t>(carried_entity) < entities.size())
+    {
+        auto& e = entities[carried_entity];
+        if (lift_phase == 1)
+        {
+            lift_t += dt;
+            e.x = player_x; e.y = player_y;
+            e.z = player_z + 0.3 + (CARRY_HEIGHT - 0.3) * std::min(1.0, lift_t / (LIFT_TIME * 0.7));
+            if (lift_t >= LIFT_TIME) { lift_phase = 0; lift_t = 0.0; }
+        }
+        else if (lift_phase == 2)
+        {
+            lift_t += dt;
+            const double k = std::min(1.0, lift_t / LIFT_TIME);
+            e.x = player_x + (drop_x - player_x) * k;
+            e.y = player_y + (drop_y - player_y) * k;
+            e.z = (player_z + CARRY_HEIGHT) + (drop_z - (player_z + CARRY_HEIGHT)) * k;
+            if (lift_t >= LIFT_TIME)
+            {
+                e.x = drop_x; e.y = drop_y; e.z = drop_z;
+                e.carried = false;
+                e.solid = e.saved_solid;
+                carried_entity = -1;
+                lift_phase = 0;
+                Sfx(SoundEngine::SFX_JUMP_LAND);
+            }
+        }
+        else
+        {
+            e.x = player_x; e.y = player_y;
+            e.z = player_z + CARRY_HEIGHT;
+        }
+    }
+    for (std::size_t i = 0; i < entities.size(); ++i)
+    {
+        auto& e = entities[i];
+        if (!e.thrown) continue;
+        e.thrown_t += dt;
+        if (e.tvx != 0.0 || e.tvy != 0.0)
+        {
+            const double nx = e.x + e.tvx * dt, ny = e.y + e.tvy * dt;
+            if (IsWalkable(static_cast<int>(std::floor(nx)), static_cast<int>(std::floor(ny))) && (e.thrown_t < 0.15 || CanEnemyStandAt(i, nx, ny, e.z))) { e.x = nx; e.y = ny; }
+            else e.tvx = e.tvy = 0.0;
+            e.tvx *= (1.0 - 0.8 * dt); e.tvy *= (1.0 - 0.8 * dt);
+        }
+        const double floor_h = EnemyFloor(i);
+        if (e.thrown_t > 0.08 && e.z <= floor_h + 1e-6)
+        {
+            e.thrown = false;
+            e.falls = false;
+            e.tvx = e.tvy = 0.0;
+            e.z = floor_h;
+            if (e.type == 17 && game)   // a vase shatters
+            {
+                game->MarkCollected(room_number, static_cast<int>(i));
+                e.visible = false;
+                SpawnSparks(e.x, e.y, e.z + 0.5, true, false);
+            }
+            Sfx(SoundEngine::SFX_JUMP_LAND);
+        }
+    }
+}
+
 void RoomView::Interact()
 {
     if (!dialogue_pages.empty()) { AdvanceDialogue(); return; }
+    if (carried_entity >= 0)
+    {
+        if (lift_phase == 0) { if (grounded) PutDownCarried(); else ThrowCarried(); }
+        return;
+    }
+    if (lift_phase == 0 && TryPickUp()) return;
     if (StartDialogue()) return;
     if (TryShop()) return;
     if (!game || !entity_table) return;
@@ -3483,7 +3945,7 @@ void RoomView::Interact()
         const auto& e = entities[i];
         if (e.type != 18 || !e.visible) continue;   // entity 18 = chest
         const int ordinal = chest_ordinal++;
-        const double half = entity_table->GetHitboxBase(e.type) / 16.0;
+        const double half = entity_table->GetHitboxBase(e.type) / 16.0 + 0.2;   // (a chest on a cell corner is still in front of the player)
         const double top = e.z + entity_table->GetHitboxHeight(e.type) / 16.0;
         if (std::abs(qx - e.x) > half || std::abs(qy - e.y) > half) continue;
         if (player_z >= top || player_z + PLAYER_HEIGHT <= e.z) continue;
@@ -3563,7 +4025,7 @@ void RoomView::Step(int dir_x, int dir_y, double dt)
     const bool was_moving = moving;
     moving = false;
     blocked_text.clear();
-    if (dead || swinging || chest_open.active || knock_time > 0.0 || !dialogue_pages.empty() || cutscene_busy > 0.0 || input_hold > 0.0 || fainted ||
+    if (dead || swinging || chest_open.active || lift_phase != 0 || knock_time > 0.0 || !dialogue_pages.empty() || cutscene_busy > 0.0 || input_hold > 0.0 || fainted ||
         (game && game->HasStatus(GameState::STATUS_PARALYSIS)))
         dir_x = dir_y = 0;
     // Ladders (floor 0x0B: against the NW wall, 0x0C: against the NE wall): pressing towards the wall climbs
@@ -3636,7 +4098,7 @@ void RoomView::Step(int dir_x, int dir_y, double dt)
     {
         int idx = -1;
         const double top = PlatformTop(player_x, player_y, player_z, &idx);
-        support_entity = (grounded && idx >= 0 && std::abs(player_z - top) < 2 * PLATFORM_TOLERANCE) ? idx : -1;
+        support_entity = (grounded && idx >= 0 && std::abs(player_z - top) < 0.1) ? idx : -1;
     }
     CheckPickups();
     CheckSwitches();
@@ -3651,7 +4113,11 @@ void RoomView::Step(int dir_x, int dir_y, double dt)
     const double wx = riding ? entities[support_entity].x : player_x, wy = riding ? entities[support_entity].y : player_y;
     if (riding && std::hypot(wx - arrival_x, wy - arrival_y) < 3.0) warp_armed = false;
     const int cx = static_cast<int>(std::floor(wx)), cy = static_cast<int>(std::floor(wy));
-    if (cx != cursor_x || cy != cursor_y || (riding && !warp_armed))
+    // Standing in a doorway whose warp was refused (not yet at the floor's height) is looked at again.
+    bool in_zone = false;
+    for (const auto& w : warps)
+        if (cx >= w.x && cx < w.x + w.w && cy >= w.y && cy < w.y + w.h) { in_zone = true; break; }
+    if (cx != cursor_x || cy != cursor_y || (riding && !warp_armed) || (in_zone && warp_armed))
     {
         cursor_x = cx;
         cursor_y = cy;
@@ -3733,6 +4199,8 @@ void RoomView::Respawn()
     game_over_shown = false;
     death_time = 0.0;
     hurt_time = 0.0;
+    knock_time = swing_time = attack_cooldown = 0.0;
+    swinging = false;
     invulnerable_time = HIT_INVULNERABILITY;
     fx_level = 0.0; fx_mode = FxMode::NONE; cutscene_busy = 0.0; busy_then_warp = false; friday_state = 0;
     fainted = false; player_hidden = false; input_hold = 0.0; faint_warp = false;
@@ -3750,7 +4218,11 @@ void RoomView::Respawn()
     }
     else
     {
-        LoadRoom(room_number);
+        // No church recorded yet: start the room again where the player came in.
+        const SDL_Point here{ static_cast<int>(std::floor(arrival_x)), static_cast<int>(std::floor(arrival_y)) };
+        const double ax = arrival_x, ay = arrival_y;
+        LoadRoom(room_number, &here);
+        SetPlayerPosition(ax, ay);
         ShowMessage("Back on your feet");
     }
 }
@@ -3794,17 +4266,23 @@ void RoomView::SimulateMove(int dir_x, int dir_y, double seconds)
 {
     const double slice = 1.0 / 60.0;
     for (double t = 0.0; t < seconds; t += slice)
+    {
         Step(dir_x, dir_y, slice);
+        UpdateCarry(slice);
+    }
 }
 
 void RoomView::OnUpdate(double delta)
 {
+    if (intro_caption > 0 && (intro_caption_t -= delta) <= 0.0) intro_caption = 0;
     if (delta > 0.1) delta = 0.1;   // e.g. after a stall or while dragging the window
     frame_dt = delta;
     if (paused) return;
     UpdateAnimations(delta);
     input_hold = std::max(0.0, input_hold - delta);
     UpdateFaint(delta);
+    UpdateIdol(delta);
+    UpdateCarry(delta);
     if (jingle_time > 0.0)
     {
         jingle_time -= delta;
@@ -3947,6 +4425,8 @@ bool RoomView::IceSlide(int& dir_x, int& dir_y) const
     }
 }
 
+bool RoomView::support_is_raft_ok() const { return support_entity >= 0 && support_entity < static_cast<int>(entities.size()) && entities[support_entity].type == 53; }
+
 void RoomView::CheckWarps()
 {
     const RoomWarp* hit = nullptr;
@@ -3960,6 +4440,9 @@ void RoomView::CheckWarps()
     }
     if (!hit) { warp_armed = true; return; }
     if (!warp_armed) return;
+    // A doorway only works at the height of its floor: standing on something above it (a block that
+    // plugs the opening) does not take the warp.
+    if (!support_is_raft_ok() && std::abs(player_z - FloorHeight(cursor_x, cursor_y)) > 0.75) return;
     // A locked door cannot be walked through (opening it swaps its cells for an open doorway).
     {
         const int floor_type = GetCell(cursor_x, cursor_y) & 0x3F;
@@ -4277,6 +4760,26 @@ void RoomView::DrawEntities(SDL_Renderer* renderer)
         {
             pick(anim(17), faint_t, DEATH_ANIM_TIME);   // lying on the ground
         }
+        else if (lift_phase != 0)
+        {
+            // Lifting (frames 2, 1, 0 of animation 4/5) or setting down (0, 1, 2).
+            const auto& a = anim(4);
+            if (!a.empty())
+            {
+                const std::size_t step = std::min<std::size_t>(a.size() - 1, static_cast<std::size_t>(lift_t / (LIFT_TIME / a.size())));
+                frame = a[lift_phase == 1 ? a.size() - 1 - step : step];
+            }
+        }
+        else if (carried_entity >= 0 && !grounded)
+        {
+            const auto& a = anim(10);   // jumping with the load
+            if (!a.empty()) frame = a[vertical_speed > 0.0 ? 0 : std::min<std::size_t>(1, a.size() - 1)];
+        }
+        else if (carried_entity >= 0)
+        {
+            const auto& a = anim(6);    // walking (or standing) with the load over the head
+            if (!a.empty()) frame = moving ? a[static_cast<std::size_t>(anim_time / WALK_FRAME_TIME) % a.size()] : a[0];
+        }
         else if (chest_open.active && chest_open.t >= CHEST_OPEN_TIME)
         {
             // Holding the item up (animation 16).
@@ -4499,6 +5002,7 @@ void RoomView::Draw(SDL_Renderer* renderer)
     SDL_SetRenderClipRect(renderer, &viewport);
     DrawWorld(renderer);
     DrawFriday(renderer);
+    DrawIntroCaption(renderer);
     if (fx_level > 0.0)
     {
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);

@@ -33,6 +33,13 @@
 #include "debug/Bot.h"
 #include "debug/CrashLog.h"
 #include "game/Dialogue.h"
+#ifdef PLAYTEST
+#include "playtest/PlaytestPanel.h"
+constexpr int PANEL_W = 440;   // playtest build: notes panel to the right of the game
+#else
+constexpr int PANEL_W = 0;
+#endif
+constexpr int GAME_W = 1280;
 
 const std::string CHARSET = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz*.,?!/<>:-'\"%#&()=[]{}@";
 std::shared_ptr<Graphics> graphics;
@@ -43,6 +50,9 @@ std::shared_ptr<GameState> game_state;
 std::shared_ptr<SoundEngine> sound_engine;
 std::shared_ptr<RoomView> room_view;
 std::shared_ptr<TextBox> status_box;   // the debug line at the top
+#ifdef PLAYTEST
+std::shared_ptr<PlaytestPanel> playtest_panel;
+#endif
 std::shared_ptr<Menus> menus;   // title, pause, game over, slots, options
 bool want_title = false;
 std::filesystem::path pref_dir;
@@ -65,7 +75,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     }
 
     /* Create the window */
-    graphics = std::make_shared<Graphics>(1280, 1024, PROJECT_NAME);
+    graphics = std::make_shared<Graphics>(GAME_W + PANEL_W, 1024, PROJECT_NAME);
     if (!graphics) {
         return SDL_APP_FAILURE;
     }
@@ -87,7 +97,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     SDL_Rect main_viewport = {
         0,
         static_cast<int>(hud->GetExternalHeightPixels()),
-        static_cast<int>(graphics->GetWidth()),
+        GAME_W,
         static_cast<int>(graphics->GetHeight() - hud->GetExternalHeightPixels())
     };
     // Optional argument: starting room number (rooms are in ASSETS_PATH/rooms/room_NNN).
@@ -98,7 +108,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     status_box = std::make_shared<TextBox>(ui_tiles, ui_pal, menu_font, "", 8, main_viewport.y + 8, 720, 16, false, 2.0f, 2.0f);
     // Dialogue box: shown only while a conversation is open (added to / removed from drawables).
     auto dialogue_box = std::make_shared<TextBox>(ui_tiles, ui_pal, main_font, "", 48,
-        graphics->GetHeight() - 220, graphics->GetWidth() - 96, 160, false, 2.0f, 2.0f);
+        graphics->GetHeight() - 220, GAME_W - 96, 160, false, 2.0f, 2.0f);
     // Item menu: like the dialogue box, only in drawables while it is open.
     auto menu_box = std::make_shared<TextBox>(ui_tiles, ui_pal, main_font, "", 240, 120, 800, 440, false, 2.0f, 2.0f);
     auto message = std::make_shared<TextBox>(ui_tiles, ui_pal, menu_font, "", 8, main_viewport.y + 48, 720, 16, false, 2.0f, 2.0f);
@@ -293,6 +303,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
                 }
             }
         }
+        if (std::getenv("LS_KEYS") && std::getenv("LS_LOG_POS")) SDL_Log("after the keys: %s", room->DebugPos().c_str());
     } catch (const std::exception& e) {
         SDL_Log("Unable to load room %d from '%s': %s", start_room, rooms_dir.string().c_str(), e.what());
         status_box->SetLabelText(std::string("Room load error: ") + e.what());
@@ -307,7 +318,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
         ctx.ui_tiles = ui_tiles;
         ctx.ui_palette = ui_pal;
         ctx.font = main_font;
-        ctx.viewport = SDL_Rect{ 0, 0, static_cast<int>(graphics->GetWidth()), static_cast<int>(graphics->GetHeight()) };
+        ctx.viewport = SDL_Rect{ 0, 0, GAME_W, static_cast<int>(graphics->GetHeight()) };
         ctx.room = room_view;
         ctx.sound = sound_engine;
         ctx.drawables = &drawables;
@@ -338,9 +349,27 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
         {
             const char* limit = std::getenv("LS_BOT_TIME");
             Bot bot(*room_view, game_state, std::filesystem::path(ASSETS_PATH "/rooms"));
-            bot.Run(std::atoi(target), limit ? std::atof(limit) : 7200.0);
+            bot.Run(std::string(target), limit ? std::atof(limit) : 7200.0);
         }
     }
+#ifdef PLAYTEST
+    {
+        std::filesystem::path dir = ".";
+        if (const char* base = SDL_GetBasePath()) dir = base;
+        if (std::getenv("LS_PLAYTEST_SELFTEST")) dir = std::filesystem::temp_directory_path() / "ls_playtest_selftest";   // (never the player's notes)
+        std::filesystem::create_directories(dir);
+        playtest_panel = std::make_shared<PlaytestPanel>(graphics->GetRenderer(),
+            []() { return room_view ? room_view->GetRoomNumber() : -1; }, GAME_W, PANEL_W, static_cast<int>(graphics->GetHeight()), GAME_W, dir);
+        PlaytestPanel::Hooks hooks;
+        hooks.go_room = [](int n) { return room_view && room_view->GoToRoom(n); };
+        hooks.hp_delta = [](int d) { if (game_state) game_state->SetMaxHealthHearts(game_state->GetMaxHealth() + d); };
+        hooks.hp_full = []() { if (game_state) game_state->HealFull(); };
+        hooks.hp_text = []() { return game_state ? std::to_string(game_state->GetHealth()) + "/" + std::to_string(game_state->GetMaxHealth()) : std::string(); };
+        hooks.control_lock = []() { return room_view ? room_view->ControlLockReason() : std::string(); };
+        playtest_panel->SetHooks(hooks);
+        drawables.push_back(playtest_panel);   // last: above everything
+    }
+#endif
     return SDL_APP_CONTINUE;
 }
 
@@ -351,7 +380,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
     {
         return SDL_APP_SUCCESS;  /* end the program, reporting success to the OS. */
     }
-    else if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP)
+#ifdef PLAYTEST
+    if (playtest_panel && playtest_panel->HandleEvent(*event)) return SDL_APP_CONTINUE;
+#endif
+    if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP)
     {
         auto keycode = SDL_GetKeyFromScancode(event->key.scancode, event->key.mod, false);
         if(event->type == SDL_EVENT_KEY_DOWN && keycode == SDLK_ESCAPE)
@@ -374,11 +406,72 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         hud->SetMaxHealth(static_cast<unsigned int>(game_state->GetMaxHealth()));
         hud->SetCurrentHealth(static_cast<unsigned int>(game_state->GetHealth()));
     }
-    std::for_each(drawables.begin(), drawables.end(), [delta](auto& d){ d->OnUpdate(delta); });
-    Timer::ProcessTicks([](unsigned int tick_count)
+#ifdef PLAYTEST
+    // Debug aid: LS_PLAYTEST_SELFTEST=1 types a note and takes a screenshot through synthetic events.
+    if (std::getenv("LS_PLAYTEST_SELFTEST"))
     {
-        std::for_each(drawables.begin(), drawables.end(), [tick_count](auto& d){ d->OnTick(tick_count); });
-    });
+        static int frame = 0;
+        ++frame;
+        auto push_mouse = [](Uint32 type, float x, float y) {
+            SDL_Event ev{};
+            ev.type = type;
+            if (type == SDL_EVENT_MOUSE_MOTION) { ev.motion.x = x; ev.motion.y = y; }
+            else { ev.button.x = x; ev.button.y = y; ev.button.button = SDL_BUTTON_LEFT; ev.button.down = type == SDL_EVENT_MOUSE_BUTTON_DOWN; }
+            SDL_PushEvent(&ev);
+        };
+        if (frame == 10) push_mouse(SDL_EVENT_MOUSE_BUTTON_DOWN, 1500, 300);
+        if (frame == 11) push_mouse(SDL_EVENT_MOUSE_BUTTON_UP, 1500, 300);
+        if (frame == 12 || frame == 13)
+        {
+            SDL_Event ev{};
+            ev.type = SDL_EVENT_TEXT_INPUT;
+            ev.text.text = frame == 12 ? "Hello room, it works." : " Second line with a long text to see how the wrapping behaves in the panel.";
+            SDL_PushEvent(&ev);
+        }
+        if (frame == 20) { SDL_Event ev{}; ev.type = SDL_EVENT_KEY_DOWN; ev.key.key = SDLK_F12; ev.key.down = true; SDL_PushEvent(&ev); }
+        if (frame == 24) push_mouse(SDL_EVENT_MOUSE_BUTTON_DOWN, 300, 200);
+        if (frame == 25) push_mouse(SDL_EVENT_MOUSE_MOTION, 700, 600);
+        if (frame == 26) push_mouse(SDL_EVENT_MOUSE_BUTTON_UP, 700, 600);
+        // LS_PLAYTEST_MASH=n presses the action key every 20 frames and quits after n frames (dialogues open and close)
+        if (const char* mash = std::getenv("LS_PLAYTEST_MASH"))
+        {
+            if (frame % 20 == 0) { SDL_Event ev{}; ev.type = SDL_EVENT_KEY_DOWN; ev.key.scancode = SDL_SCANCODE_LSHIFT; ev.key.key = SDLK_LSHIFT; ev.key.down = true; SDL_PushEvent(&ev); }
+            if (frame % 20 == 3) { SDL_Event ev{}; ev.type = SDL_EVENT_KEY_UP; ev.key.scancode = SDL_SCANCODE_LSHIFT; ev.key.key = SDLK_LSHIFT; SDL_PushEvent(&ev); }
+            if (frame > std::atoi(mash)) { SDL_Event ev{}; ev.type = SDL_EVENT_QUIT; SDL_PushEvent(&ev); }
+        }
+        // LS_PLAYTEST_ROOMS="139,140,..." visits these rooms through the panel's room hook (crash hunting)
+        if (const char* rooms = std::getenv("LS_PLAYTEST_ROOMS"))
+        {
+            static std::vector<int> list;
+            if (list.empty()) { std::string t = rooms; for (char& c : t) if (c == ',') c = ' '; std::istringstream is(t); int n; while (is >> n) list.push_back(n); }
+            if (frame % 90 == 0 && frame / 90 <= static_cast<int>(list.size()) && room_view) room_view->GoToRoom(list[frame / 90 - 1]);
+            if (frame > 90 * static_cast<int>(list.size()) + 60) { SDL_Event ev{}; ev.type = SDL_EVENT_QUIT; SDL_PushEvent(&ev); }
+        }
+        if (frame == 28 && !std::getenv("LS_PLAYTEST_MASH")) push_mouse(SDL_EVENT_MOUSE_BUTTON_DOWN, 1352, 130);
+        if (frame == 29) push_mouse(SDL_EVENT_MOUSE_BUTTON_UP, 1352, 130);
+        if (frame == 30) { SDL_Event ev{}; ev.type = SDL_EVENT_TEXT_INPUT; ev.text.text = "13"; SDL_PushEvent(&ev); }
+        if (frame == 31) { SDL_Event ev{}; ev.type = SDL_EVENT_KEY_DOWN; ev.key.key = SDLK_RETURN; ev.key.down = true; SDL_PushEvent(&ev); }
+        if (frame == 33 || frame == 35) push_mouse(SDL_EVENT_MOUSE_BUTTON_DOWN, 1370, 176);
+        if (frame == 34 || frame == 36) push_mouse(SDL_EVENT_MOUSE_BUTTON_UP, 1370, 176);
+        if (frame == 40 && !std::getenv("LS_PLAYTEST_ROOMS") && !std::getenv("LS_PLAYTEST_MASH")) { SDL_Event ev{}; ev.type = SDL_EVENT_QUIT; SDL_PushEvent(&ev); }
+    }
+#endif
+#ifdef PLAYTEST
+    const bool frozen_game = playtest_panel && playtest_panel->IsSelecting();   // choosing a screenshot area: the game waits
+    if (frozen_game) playtest_panel->OnUpdate(delta);
+#else
+    const bool frozen_game = false;
+#endif
+    if (!frozen_game)
+    {
+        // (a copy: updates open and close boxes, which adds to / removes from `drawables` meanwhile)
+        const auto snapshot = drawables;
+        std::for_each(snapshot.begin(), snapshot.end(), [delta](const auto& d){ d->OnUpdate(delta); });
+        Timer::ProcessTicks([&snapshot](unsigned int tick_count)
+        {
+            std::for_each(snapshot.begin(), snapshot.end(), [tick_count](const auto& d){ d->OnTick(tick_count); });
+        });
+    }
     graphics->Render(drawables);
 
     return SDL_APP_CONTINUE;
@@ -387,5 +480,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 /* This function runs once at shutdown. */
 void SDL_AppQuit(void *appstate, SDL_AppResult result)
 {
+#ifdef PLAYTEST
+    if (playtest_panel) playtest_panel->Flush();
+#endif
     sound_engine.reset();   // stops the audio callback before SDL shuts down
 }

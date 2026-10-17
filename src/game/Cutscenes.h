@@ -24,7 +24,7 @@ public:
 
     struct Op
     {
-        enum Kind { TEXT, FLAG, SOUND, SWAP, IF, WARP, LOCK, HOSTILE, VISIBLE, HIDE, BLOCK, FX, WAIT, FRIDAY, CREDITS } kind = TEXT;
+        enum Kind { TEXT, FLAG, SOUND, SWAP, IF, WARP, LOCK, HOSTILE, VISIBLE, HIDE, BLOCK, FX, WAIT, FRIDAY, CREDITS, INTRO_STRING } kind = TEXT;
         int value = 0;       // cutscene text id / flag / sound id / swap trigger
         bool set = true;     // FLAG: set or clear
         // IF: the condition (a story flag, or the answer to the yes/no question just asked)
@@ -125,6 +125,7 @@ private:
             else if (const Json* v = o.Find("hostile")) { op.kind = Op::HOSTILE; op.value = v->Int(-1); op.set = o.Find("set") ? o.Find("set")->boolean : true; out.push_back(op); }
             else if (const Json* v = o.Find("visible")) { op.kind = Op::VISIBLE; op.value = v->Int(-1); op.set = o.Find("set") ? o.Find("set")->boolean : true; out.push_back(op); }
             else if (o.Find("credits")) { op.kind = Op::CREDITS; out.push_back(op); }
+            else if (const Json* v = o.Find("intro_string")) { op.kind = Op::INTRO_STRING; op.value = v->Int(); out.push_back(op); }
             else if (const Json* v = o.Find("fx")) { op.kind = Op::FX; op.name = v->string; out.push_back(op); }
             else if (const Json* v = o.Find("wait")) { op.kind = Op::WAIT; op.value = v->Int(); out.push_back(op); }
             else if (const Json* v = o.Find("friday")) { op.kind = Op::FRIDAY; op.name = v->string; out.push_back(op); }

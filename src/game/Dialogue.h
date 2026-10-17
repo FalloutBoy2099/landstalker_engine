@@ -36,6 +36,7 @@ public:
         const Json* no = nullptr;
         bool asks = false;
         std::vector<int> give_now;   // items given as soon as the conversation starts
+        std::vector<int> actions;    // custom script actions to run once the boxes are dismissed
     };
 
     // allowed: the characters the engine font can draw; anything else becomes '?'.
@@ -107,6 +108,14 @@ private:
                     // Received after the box before it; before any box: right away.
                     if (!c.pages.empty()) c.pages.back().give_item = g->Int();
                     else c.give_now.push_back(g->Int());
+                }
+                else if (const Json* sf = s.Find("set_flag"))
+                {
+                    gs.SetFlag(sf->Int());
+                }
+                else if (const Json* ac = s.Find("action"))
+                {
+                    c.actions.push_back(ac->Int());
                 }
             }
         }

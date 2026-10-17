@@ -9,10 +9,20 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <cstdio>
+#include <string>
 #pragma comment(lib, "dbghelp.lib")
 
 inline LONG WINAPI CrashLogFilter(EXCEPTION_POINTERS* info)
 {
+    // The GUI exe has no console: the trace goes to crash.log next to the exe.
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string file = path;
+        const auto slash = file.find_last_of("\\/");
+        file = (slash == std::string::npos ? std::string() : file.substr(0, slash + 1)) + "crash.log";
+        std::freopen(file.c_str(), "a", stderr);
+    }
     HANDLE process = GetCurrentProcess();
     SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     SymInitialize(process, nullptr, TRUE);
